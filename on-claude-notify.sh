@@ -44,50 +44,55 @@ as_escape() {
 payload=$(cat)
 [[ -z "$payload" ]] && exit 0
 
-# Single node call extracts everything we need
-eval "$(node -e '
-    const p = JSON.parse(process.argv[1]);
-    const ti = p.tool_input || {};
-    const ps = p.permission_suggestions || [];
+# Single node call extracts everything we need.
+# Payload is passed via stdin (not argv) to avoid shell metacharacter issues
+# with $(), backticks, etc. in tool_input commands.
+# Node writes to a temp file; we source it (no eval of stdout).
+_parse_tmp=$(mktemp)
+_script_tmp=$(mktemp)
+cat > "$_script_tmp" << 'NODESCRIPT'
+const p = JSON.parse(require("fs").readFileSync(0, "utf8"));
+const ti = p.tool_input || {};
+const ps = p.permission_suggestions || [];
 
-    // tool summary
-    let ts = "";
-    try {
-        const s = JSON.stringify(ti);
-        ts = s.length > 300 ? s.slice(0, 297) + "..." : s;
-        if (ts === "{}") ts = "";
-    } catch(e) {}
+let ts = "";
+try {
+    const s = JSON.stringify(ti);
+    ts = s.length > 300 ? s.slice(0, 297) + "..." : s;
+    if (ts === "{}") ts = "";
+} catch(e) {}
 
-    // AskUserQuestion options
-    let qText = "", optLabels = [], optList = "";
-    if ((p.tool_name || "") === "AskUserQuestion" && ti.questions && ti.questions[0]) {
-        const q = ti.questions[0];
-        qText = q.question || q.header || "";
-        (q.options || []).forEach((o, i) => {
-            const label = o.label || o.value || String(o);
-            const desc = o.description ? " - " + o.description : "";
-            optLabels.push(label);
-            optList += (i+1) + ". " + label + desc + "\n";
-        });
-    }
+let qText = "", optLabels = [];
+if ((p.tool_name || "") === "AskUserQuestion" && ti.questions && ti.questions[0]) {
+    const q = ti.questions[0];
+    qText = q.question || q.header || "";
+    (q.options || []).forEach((o) => {
+        optLabels.push(o.label || o.value || String(o));
+    });
+}
 
-    // permission_suggestions as JSON for updatedPermissions
-    const psJson = ps.length > 0 ? JSON.stringify(ps) : "";
+const psJson = ps.length > 0 ? JSON.stringify(ps) : "";
 
-    const esc = s => String(s).replace(/\\/g, "\\\\").replace(/"/g, "\\\"").replace(/\n/g, "\\n").replace(/`/g, "\\`").replace(/\\$/g, "\\$");
+// Single-quote wrap: replace ' with '\'' for safe shell sourcing
+const sq = s => "'" + String(s).replace(/'/g, "'\\''") + "'";
 
-    console.log("hook_event=\"" + esc(p.hook_event_name || "") + "\"");
-    console.log("tool_name=\"" + esc(p.tool_name || "") + "\"");
-    console.log("tool_summary=\"" + esc(ts) + "\"");
-    console.log("notif_type=\"" + esc(p.notification_type || "") + "\"");
-    console.log("message=\"" + esc(p.message || "") + "\"");
-    console.log("cwd=\"" + esc(p.cwd || "") + "\"");
-    console.log("prompt=\"" + esc(p.prompt || "") + "\"");
-    console.log("question_text=\"" + esc(qText) + "\"");
-    console.log("option_labels=\"" + esc(optLabels.join("|")) + "\"");
-    console.log("option_count=" + optLabels.length);
-    console.log("perm_suggestions=\"" + esc(psJson) + "\"");
-' "$payload" 2>/dev/null)" 2>/dev/null || { log "Parse failed"; exit 0; }
+console.log("hook_event=" + sq(p.hook_event_name || ""));
+console.log("tool_name=" + sq(p.tool_name || ""));
+console.log("tool_summary=" + sq(ts));
+console.log("notif_type=" + sq(p.notification_type || ""));
+console.log("message=" + sq(p.message || ""));
+console.log("cwd=" + sq(p.cwd || ""));
+console.log("prompt=" + sq(p.prompt || ""));
+console.log("question_text=" + sq(qText));
+console.log("option_labels=" + sq(optLabels.join("|")));
+console.log("option_count=" + optLabels.length);
+console.log("perm_suggestions=" + sq(psJson));
+NODESCRIPT
+node "$_script_tmp" <<< "$payload" > "$_parse_tmp" 2>/dev/null
+rm -f "$_script_tmp"
+# shellcheck disable=SC1090
+source "$_parse_tmp" 2>/dev/null || { rm -f "$_parse_tmp"; log "Parse failed"; exit 0; }
+rm -f "$_parse_tmp"
 
 log "Event: $hook_event | Tool: $tool_name | Opts: $option_count"
 
