@@ -227,8 +227,42 @@ APPL
 
         log "PermissionRequest options result: '$result'"
 
-        # Allow the tool so it proceeds
-        cat <<'ENDJSON'
+        if [[ "$result" != "SKIP" ]]; then
+            selected_num="${result%%.*}"
+            # Get the selected label
+            IFS='|' read -ra sel_labels <<< "$option_labels"
+            if [[ "$selected_num" -le "$option_count" ]]; then
+                selected_label="${sel_labels[$((selected_num-1))]}"
+            else
+                selected_label="Other"
+            fi
+            log "Selected label: '$selected_label' for question: '$question_text'"
+
+            # Use updatedInput.answers to pass the selection back through the hook response
+            _ans_tmp=$(mktemp)
+            cat > "$_ans_tmp" << 'ANSSCRIPT'
+// argv: [node, script_path, question_text, answer_label]
+const qText = process.argv[2];
+const answer = process.argv[3];
+const result = {
+    hookSpecificOutput: {
+        hookEventName: "PermissionRequest",
+        decision: {
+            behavior: "allow",
+            updatedInput: {
+                answers: {}
+            }
+        }
+    }
+};
+result.hookSpecificOutput.decision.updatedInput.answers[qText] = answer;
+console.log(JSON.stringify(result));
+ANSSCRIPT
+            node "$_ans_tmp" "$question_text" "$selected_label" 2>/dev/null
+            rm -f "$_ans_tmp"
+        else
+            # SKIP — just allow without answer
+            cat <<'ENDJSON'
 {
   "hookSpecificOutput": {
     "hookEventName": "PermissionRequest",
@@ -238,25 +272,6 @@ APPL
   }
 }
 ENDJSON
-
-        # Send selection via tmux in background
-        if [[ "$result" != "SKIP" ]]; then
-            selected_num="${result%%.*}"
-            (
-                sleep 1.0
-                if [[ "$selected_num" -le "$option_count" ]]; then
-                    for (( i=1; i<selected_num; i++ )); do
-                        send_keys Down; sleep 0.1
-                    done
-                    send_keys Enter
-                else
-                    for (( i=1; i<=option_count; i++ )); do
-                        send_keys Down; sleep 0.1
-                    done
-                    send_keys Enter
-                fi
-                log "Sent options selection $selected_num for $tool_name"
-            ) &
         fi
         exit 0
     fi
