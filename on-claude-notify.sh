@@ -1,38 +1,31 @@
 #!/usr/bin/env bash
 #
-# on-claude-notify.sh - Hook handler called by Claude Code's hook system
+# on-claude-notify.sh - Hook handler for Claude Code
 #
-# Invoked by Claude Code when events fire.  Receives a JSON payload on stdin.
+# PermissionRequest — fires ONLY when permission is needed. Shows popup dialog,
+#   returns hookSpecificOutput with decision.behavior = allow/deny.
+#   Supports "Always Allow" via updatedPermissions from permission_suggestions.
 #
-# PreToolUse — Claude waits and reads stdout for allow/deny decision.
-#   Shows a blocking GUI dialog; outputs {"decision":"allow"} or {"decision":"deny"}
-#   so Claude can proceed without the user touching the terminal.
+# PreToolUse — fires for ALL tool calls. For AskUserQuestion/ExitPlanMode,
+#   shows dynamic options popup and sends selection via tmux.
+#   For all others, exits 0 silently (let normal permission system handle it).
 #
-# Elicitation — Claude waits and reads stdout for the user's response.
-#   Shows a blocking text-input dialog; outputs the response as JSON.
-#
-# Notification — fire-and-forget.
-#   Sends a macOS notification (no response needed).
+# Notification — fire-and-forget macOS notification.
 #
 # Works with or without tmux.
 #
 
 STATE_DIR="/tmp/claude-watcher"
-ALERTS_DIR="$STATE_DIR/alerts"
-QUEUE_DIR="$STATE_DIR/popup-queue"
 LOG_FILE="$STATE_DIR/watcher.log"
 AUTO_FOCUS="${CLAUDE_WATCHER_AUTO_FOCUS:-true}"
-SOUND_FILE="${CLAUDE_WATCHER_SOUND:-/System/Library/Sounds/Glass.aiff}"
 ACTIVE_FILE="$STATE_DIR/active"
 
-mkdir -p "$STATE_DIR" "$ALERTS_DIR" "$QUEUE_DIR"
+mkdir -p "$STATE_DIR"
 
-# Exit silently if the watcher is not active (i.e. `claude-watcher stop` was called)
 if [[ ! -f "$ACTIVE_FILE" ]]; then
     exit 0
 fi
 
-# Detect whether tmux is available and we're inside a tmux session
 HAS_TMUX=false
 if command -v tmux &>/dev/null && [[ -n "${TMUX:-}" ]]; then
     HAS_TMUX=true
@@ -46,70 +39,62 @@ as_escape() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
-# ── Read JSON payload from stdin ──────────────────────────────────────────────
+# ── Read + parse payload in one node call ─────────────────────────────────────
 
 payload=$(cat)
+[[ -z "$payload" ]] && exit 0
 
-if [[ -z "$payload" ]]; then
-    log "Empty payload received, exiting"
-    exit 0
-fi
+# Single node call extracts everything we need
+eval "$(node -e '
+    const p = JSON.parse(process.argv[1]);
+    const ti = p.tool_input || {};
+    const ps = p.permission_suggestions || [];
 
-# Parse all relevant fields in one node pass
-parsed=$(node -e "
+    // tool summary
+    let ts = "";
     try {
-        const p = JSON.parse(process.argv[1]);
-        const tool = p.tool_use || {};
-        const toolName  = p.tool_name  || tool.name  || '';
-        const toolInput = p.tool_input || tool.input || {};
-        let inputSummary = '';
-        try {
-            const s = JSON.stringify(toolInput);
-            inputSummary = s.length > 200 ? s.slice(0, 197) + '...' : s;
-            if (inputSummary === '{}') inputSummary = '';
-        } catch(e) {}
+        const s = JSON.stringify(ti);
+        ts = s.length > 300 ? s.slice(0, 297) + "..." : s;
+        if (ts === "{}") ts = "";
+    } catch(e) {}
 
-        const out = {
-            event:        p.hook_event_name    || '',
-            notif_type:   p.notification_type  || '',
-            message:      p.message            || '',
-            title:        p.title              || 'Claude Code',
-            session_id:   p.session_id         || '',
-            cwd:          p.cwd                || '',
-            tool_name:    toolName,
-            tool_summary: inputSummary,
-            prompt:       p.prompt             || (p.request_info && p.request_info.prompt) || ''
-        };
-        console.log(JSON.stringify(out));
-    } catch(e) {
-        console.log('{}');
+    // AskUserQuestion options
+    let qText = "", optLabels = [], optList = "";
+    if ((p.tool_name || "") === "AskUserQuestion" && ti.questions && ti.questions[0]) {
+        const q = ti.questions[0];
+        qText = q.question || q.header || "";
+        (q.options || []).forEach((o, i) => {
+            const label = o.label || o.value || String(o);
+            const desc = o.description ? " - " + o.description : "";
+            optLabels.push(label);
+            optList += (i+1) + ". " + label + desc + "\n";
+        });
     }
-" "$payload" 2>/dev/null) || parsed="{}"
 
-_field() {
-    echo "$parsed" | node -e \
-        "const d=JSON.parse(require('fs').readFileSync(0,'utf8'));console.log(d['$1']||'')" \
-        2>/dev/null || true
-}
+    // permission_suggestions as JSON for updatedPermissions
+    const psJson = ps.length > 0 ? JSON.stringify(ps) : "";
 
-hook_event=$(_field event)
-notif_type=$(_field notif_type)
-message=$(_field message)
-cwd=$(_field cwd)
-tool_name=$(_field tool_name)
-tool_summary=$(_field tool_summary)
-prompt=$(_field prompt)
+    const esc = s => String(s).replace(/\\/g, "\\\\").replace(/"/g, "\\\"").replace(/\n/g, "\\n").replace(/`/g, "\\`").replace(/\\$/g, "\\$");
 
-log "Event: $hook_event | Type: $notif_type | Tool: $tool_name | CWD: $cwd"
+    console.log("hook_event=\"" + esc(p.hook_event_name || "") + "\"");
+    console.log("tool_name=\"" + esc(p.tool_name || "") + "\"");
+    console.log("tool_summary=\"" + esc(ts) + "\"");
+    console.log("notif_type=\"" + esc(p.notification_type || "") + "\"");
+    console.log("message=\"" + esc(p.message || "") + "\"");
+    console.log("cwd=\"" + esc(p.cwd || "") + "\"");
+    console.log("prompt=\"" + esc(p.prompt || "") + "\"");
+    console.log("question_text=\"" + esc(qText) + "\"");
+    console.log("option_labels=\"" + esc(optLabels.join("|")) + "\"");
+    console.log("option_count=" + optLabels.length);
+    console.log("perm_suggestions=\"" + esc(psJson) + "\"");
+' "$payload" 2>/dev/null)" 2>/dev/null || { log "Parse failed"; exit 0; }
 
-# ── Find which tmux pane this Claude session lives in ────────────────────────
+log "Event: $hook_event | Tool: $tool_name | Opts: $option_count"
+
+# ── Pane / focus helpers ─────────────────────────────────────────────────────
 
 find_pane_id() {
-    if [[ "$HAS_TMUX" != "true" ]]; then
-        echo "no-tmux"
-        return
-    fi
-
+    if [[ "$HAS_TMUX" != "true" ]]; then echo "no-tmux"; return; fi
     local current=$PPID
     local search_pids=()
     for _ in 1 2 3 4; do
@@ -117,24 +102,16 @@ find_pane_id() {
         current=$(ps -o ppid= -p "$current" 2>/dev/null | tr -d ' ')
         [[ -z "$current" || "$current" == "1" ]] && break
     done
-
-    while IFS='|' read -r pane pane_pid; do
-        for spid in "${search_pids[@]}"; do
-            if [[ "$pane_pid" == "$spid" ]]; then
-                echo "$pane"
-                return
-            fi
+    while IFS='|' read -r pn pp; do
+        for sp in "${search_pids[@]}"; do
+            [[ "$pp" == "$sp" ]] && { echo "$pn"; return; }
         done
     done < <(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}|#{pane_pid}' 2>/dev/null)
-
     echo "unknown"
 }
 
 pane=$(find_pane_id)
 project=$(basename "${cwd:-unknown}")
-log "Pane: $pane | Project: $project | tmux: $HAS_TMUX"
-
-# ── Focus helpers ────────────────────────────────────────────────────────────
 
 detect_terminal_app() {
     osascript -e '
@@ -145,42 +122,41 @@ detect_terminal_app() {
         if appList contains "Alacritty" then return "Alacritty"
         if appList contains "kitty" then return "kitty"
         if appList contains "WezTerm" then return "WezTerm"
-        if appList contains "Hyper" then return "Hyper"
         return "Terminal"
     ' 2>/dev/null || echo "Terminal"
 }
 
 focus_pane() {
-    local term_app
-    term_app=$(detect_terminal_app)
-    osascript -e "tell application \"$term_app\" to activate" 2>/dev/null || true
-
-    if [[ "$HAS_TMUX" == "true" && -n "$pane" && "$pane" != "unknown" && "$pane" != "no-tmux" ]]; then
-        local session="${pane%%:*}"
-        local win_pane="${pane#*:}"
-        tmux switch-client -t "$session" 2>/dev/null || true
-        tmux select-window -t "$session:${win_pane%%.*}" 2>/dev/null || true
+    local ta
+    ta=$(detect_terminal_app)
+    osascript -e "tell application \"$ta\" to activate" 2>/dev/null || true
+    if [[ "$HAS_TMUX" == "true" && "$pane" != "unknown" && "$pane" != "no-tmux" ]]; then
+        tmux switch-client -t "${pane%%:*}" 2>/dev/null || true
+        tmux select-window -t "${pane%%.*}" 2>/dev/null || true
         tmux select-pane -t "$pane" 2>/dev/null || true
     fi
 }
 
-# ── PreToolUse: blocking dialog + JSON decision ─────────────────────────────
-# Claude reads stdout from PreToolUse hooks for {"decision":"allow"/"deny"}.
-# This is the correct hook type for controlling tool execution via popup.
+send_keys() {
+    [[ "$HAS_TMUX" != "true" || "$pane" == "unknown" || "$pane" == "no-tmux" ]] && return 0
+    local p="$pane"; shift
+    for k in "$@"; do tmux send-keys -t "$p" "$k" 2>/dev/null || true; done
+}
 
-if [[ "$hook_event" == "PreToolUse" ]]; then
+# ══════════════════════════════════════════════════════════════════════════════
+# PermissionRequest — fires ONLY when permission is needed
+# ══════════════════════════════════════════════════════════════════════════════
+
+if [[ "$hook_event" == "PermissionRequest" ]]; then
+    # Build dialog message
     if [[ -n "$tool_name" ]]; then
         dialog_msg="Tool: $tool_name"
-        [[ -n "$tool_summary" ]] && dialog_msg="$dialog_msg
-
-$tool_summary"
-    elif [[ -n "$message" ]]; then
-        dialog_msg="$message"
+        [[ -n "$tool_summary" ]] && dialog_msg="$dialog_msg\n\n$tool_summary"
     else
-        dialog_msg="Claude wants to use a tool."
+        dialog_msg="Claude needs your permission."
     fi
 
-    st=$(as_escape "Claude Code — Allow Tool?")
+    st=$(as_escape "Claude Code — Permission")
     sm=$(as_escape "$dialog_msg")
 
     result=$(osascript 2>/dev/null <<APPL
@@ -200,103 +176,211 @@ end try
 APPL
     ) || result="Deny"
 
-    log "PreToolUse dialog result: '$result' for tool=$tool_name"
+    log "PermissionRequest result: '$result' for $tool_name"
 
     case "$result" in
         "Allow Once")
-            echo '{"decision": "allow"}'
+            cat <<'ENDJSON'
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PermissionRequest",
+    "decision": {
+      "behavior": "allow"
+    }
+  }
+}
+ENDJSON
             exit 0
             ;;
         "Always Allow")
-            echo '{"decision": "allow", "allow_permanently": true}'
+            # Use permission_suggestions from payload for updatedPermissions
+            if [[ -n "$perm_suggestions" ]]; then
+                node -e '
+                    const ps = JSON.parse(process.argv[1]);
+                    console.log(JSON.stringify({
+                        hookSpecificOutput: {
+                            hookEventName: "PermissionRequest",
+                            decision: {
+                                behavior: "allow",
+                                updatedPermissions: ps
+                            }
+                        }
+                    }));
+                ' "$perm_suggestions" 2>/dev/null
+            else
+                cat <<'ENDJSON'
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PermissionRequest",
+    "decision": {
+      "behavior": "allow"
+    }
+  }
+}
+ENDJSON
+            fi
             exit 0
             ;;
         "Deny"|*)
-            echo '{"decision": "deny", "reason": "User denied via popup"}'
+            cat <<'ENDJSON'
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PermissionRequest",
+    "decision": {
+      "behavior": "deny",
+      "message": "User denied via popup"
+    }
+  }
+}
+ENDJSON
             exit 0
             ;;
     esac
 fi
 
-# ── PermissionRequest: just focus the terminal (fallback) ────────────────────
-# PermissionRequest is informational — Claude doesn't read stdout from it.
-# If PreToolUse didn't handle it, just focus the terminal so user sees the prompt.
+# ══════════════════════════════════════════════════════════════════════════════
+# PreToolUse — fires for ALL tool calls
+# Only intercept AskUserQuestion and ExitPlanMode for dynamic popup options.
+# Everything else: exit 0 (let normal permission system handle it).
+# ══════════════════════════════════════════════════════════════════════════════
 
-if [[ "$hook_event" == "PermissionRequest" ]]; then
-    log "PermissionRequest — focusing terminal (handled by PreToolUse hook)"
-    [[ "$AUTO_FOCUS" == "true" ]] && focus_pane
+if [[ "$hook_event" == "PreToolUse" ]]; then
+
+    # ── AskUserQuestion: dynamic options popup ───────────────────────────────
+    if [[ "$tool_name" == "AskUserQuestion" && "$option_count" -gt 0 ]]; then
+        log "AskUserQuestion: '$question_text' ($option_count options)"
+
+        # Build AppleScript list
+        as_list=""
+        IFS='|' read -ra labels <<< "$option_labels"
+        for i in "${!labels[@]}"; do
+            [[ -n "$as_list" ]] && as_list+=", "
+            as_list+="\"$((i+1)). ${labels[$i]}\""
+        done
+        as_list+=", \"$((${#labels[@]}+1)). Type something\""
+
+        sq=$(as_escape "$question_text")
+
+        result=$(osascript 2>/dev/null <<APPL
+tell application "System Events" to activate
+try
+    set chosen to choose from list {${as_list}} ¬
+        with title "Claude Code" ¬
+        with prompt "$sq" ¬
+        OK button name "Select" ¬
+        cancel button name "Skip"
+    if chosen is false then return "SKIP"
+    return item 1 of chosen
+on error
+    return "SKIP"
+end try
+APPL
+        ) || result="SKIP"
+
+        log "AskUserQuestion result: '$result'"
+
+        # Allow the tool to proceed
+        cat <<'ENDJSON'
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "allow"
+  }
+}
+ENDJSON
+
+        # Send selection via tmux in background
+        if [[ "$result" != "SKIP" ]]; then
+            selected_num="${result%%.*}"
+            (
+                sleep 1.0
+                if [[ "$selected_num" -le "$option_count" ]]; then
+                    for (( i=1; i<selected_num; i++ )); do
+                        send_keys Down; sleep 0.1
+                    done
+                    send_keys Enter
+                else
+                    for (( i=1; i<=option_count; i++ )); do
+                        send_keys Down; sleep 0.1
+                    done
+                    send_keys Enter
+                fi
+                log "Sent AskUser selection $selected_num"
+            ) &
+        fi
+        exit 0
+    fi
+
+    # ── ExitPlanMode: plan approval popup ────────────────────────────────────
+    if [[ "$tool_name" == "ExitPlanMode" ]]; then
+        log "ExitPlanMode: showing plan approval popup"
+
+        result=$(osascript 2>/dev/null <<APPL
+tell application "System Events" to activate
+try
+    set chosen to choose from list {"1. Yes, clear context and auto-accept edits", "2. Yes, auto-accept edits", "3. Yes, manually approve edits", "4. Type feedback"} ¬
+        with title "Claude Code — Plan Ready" ¬
+        with prompt "Claude has written a plan. How to proceed?" ¬
+        OK button name "Select" ¬
+        cancel button name "Skip"
+    if chosen is false then return "SKIP"
+    return item 1 of chosen
+on error
+    return "SKIP"
+end try
+APPL
+        ) || result="SKIP"
+
+        log "ExitPlanMode result: '$result'"
+
+        # Allow the tool
+        cat <<'ENDJSON'
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "allow"
+  }
+}
+ENDJSON
+
+        if [[ "$result" != "SKIP" ]]; then
+            selected_num="${result%%.*}"
+            (
+                sleep 1.0
+                for (( i=1; i<selected_num; i++ )); do
+                    send_keys Down; sleep 0.1
+                done
+                send_keys Enter
+                log "Sent plan approval selection $selected_num"
+            ) &
+        fi
+        exit 0
+    fi
+
+    # ── All other tools: exit 0 silently (normal permission system) ──────────
     exit 0
 fi
 
-# ── Elicitation: blocking dialog + JSON response ────────────────────────────
-
-if [[ "$hook_event" == "Elicitation" ]]; then
-    if [[ -n "$prompt" ]]; then
-        dialog_msg="$prompt"
-    elif [[ -n "$message" ]]; then
-        dialog_msg="$message"
-    else
-        dialog_msg="Claude is asking you a question."
-    fi
-
-    st=$(as_escape "Claude Code — Question")
-    sm=$(as_escape "$dialog_msg")
-
-    result=$(osascript 2>/dev/null <<APPL
-tell application "System Events" to activate
-try
-    set dlg to display dialog "$sm" ¬
-        with title "$st" ¬
-        default answer "" ¬
-        buttons {"Skip", "Send"} ¬
-        default button "Send" ¬
-        giving up after 300
-    if gave up of dlg then return "__POPUP_SKIP__"
-    if button returned of dlg is "Send" then
-        return text returned of dlg
-    else
-        return "__POPUP_SKIP__"
-    end if
-on error
-    return "__POPUP_SKIP__"
-end try
-APPL
-    ) || result="__POPUP_SKIP__"
-
-    log "Elicitation dialog result: '${result:0:80}' -> pane $pane"
-
-    if [[ "$result" != "__POPUP_SKIP__" && -n "$result" ]]; then
-        json_value=$(node -e "console.log(JSON.stringify(process.argv[1]))" "$result" 2>/dev/null)
-        echo "{\"result\": $json_value}"
-        exit 0
-    else
-        log "Elicitation skipped, falling back to terminal"
-        [[ "$AUTO_FOCUS" == "true" ]] && focus_pane
-        exit 2
-    fi
-fi
-
-# ── Notification events ──────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Notification — fire-and-forget
+# ══════════════════════════════════════════════════════════════════════════════
 
 if [[ "$hook_event" == "Notification" ]]; then
     subtitle="$project"
-    [[ -n "$pane" && "$pane" != "unknown" && "$pane" != "no-tmux" ]] && subtitle="$pane — $project"
+    [[ "$pane" != "unknown" && "$pane" != "no-tmux" ]] && subtitle="$pane — $project"
 
     case "$notif_type" in
         permission_prompt)
-            osascript -e "display notification \"${message:-Waiting for permission}\" with title \"Claude needs permission\" subtitle \"$subtitle\" sound name \"Glass\"" 2>/dev/null &
-            log "Permission notification sent"
+            osascript -e "display notification \"${message:-Permission needed}\" with title \"Claude Code\" subtitle \"$subtitle\" sound name \"Glass\"" 2>/dev/null &
             ;;
         idle_prompt)
             log "Idle notification — skipping"
             ;;
         *)
             osascript -e "display notification \"${message:-Needs attention}\" with title \"Claude Code\" subtitle \"$subtitle\" sound name \"Glass\"" 2>/dev/null &
-            log "Generic notification sent: $notif_type"
             ;;
     esac
     exit 0
 fi
 
-log "No actionable event ($hook_event), skipping"
 exit 0
