@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+#
+# popup-daemon - GUI popup queue processor for Claude Code interactions
+#
+# Polls the popup queue directory, shows native macOS dialogs one at a time
+# (oldest first), and forwards the user's response to the correct tmux pane.
+#
+# When tmux is not available, dialogs are shown as informational only (the
+# primary hook handlers in on-claude-notify.sh respond via stdout JSON and
+# don't need tmux).
+#
+# Start:  nohup popup-daemon >> /tmp/claude-watcher/watcher.log 2>&1 &
+# Stop:   kill $(cat /tmp/claude-watcher/popup.pid)
+#
+
+STATE_DIR="/tmp/claude-watcher"
+QUEUE_DIR="$STATE_DIR/popup-queue"
+POPUP_PID_FILE="$STATE_DIR/popup.pid"
+LOG_FILE="$STATE_DIR/watcher.log"
+
+mkdir -p "$QUEUE_DIR"
+
+# Detect tmux availability
+HAS_TMUX=false
+if command -v tmux &>/dev/null && tmux list-sessions &>/dev/null; then
+    HAS_TMUX=true
+fi
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] POPUP: $*" >> "$LOG_FILE"
+}
+
+# Escape a string for use inside an AppleScript double-quoted string.
+as_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# ── Terminal / pane focus ────────────────────────────────────────────────────
+
+detect_terminal_app() {
+    osascript -e '
+        tell application "System Events"
+            set appList to name of every application process whose visible is true
+        end tell
+        if appList contains "iTerm2" then return "iTerm2"
+        if appList contains "Alacritty" then return "Alacritty"
+        if appList contains "kitty" then return "kitty"
+        if appList contains "WezTerm" then return "WezTerm"
+        if appList contains "Hyper" then return "Hyper"
+        return "Terminal"
+    ' 2>/dev/null || echo "Terminal"
+}
+
+focus_pane() {
+    local pane="$1"
+
+    # Always bring the terminal app to the foreground
+    local term_app
+    term_app=$(detect_terminal_app)
+    osascript -e "tell application \"$term_app\" to activate" 2>/dev/null || true
+
+    # If tmux is available and we have a valid pane, switch to it
+    if [[ "$HAS_TMUX" == "true" && -n "$pane" && "$pane" != "unknown" && "$pane" != "no-tmux" ]]; then
+        local session="${pane%%:*}"
+        local win_pane="${pane#*:}"
+        tmux switch-client -t "$session" 2>/dev/null || true
+        tmux select-window -t "$session:${win_pane%%.*}" 2>/dev/null || true
+        tmux select-pane -t "$pane" 2>/dev/null || true
+    fi
+}
+
+# Send one or more tmux key names/strings to a pane.
+# No-op when tmux is unavailable or pane is unknown.
+send_keys() {
+    local pane="$1"; shift
+    if [[ "$HAS_TMUX" != "true" ]]; then
+        log "send_keys skipped (no tmux)"
+        return 0
+    fi
+    [[ -z "$pane" || "$pane" == "unknown" || "$pane" == "no-tmux" ]] && return 0
+    for key in "$@"; do
+        tmux send-keys -t "$pane" "$key" 2>/dev/null || true
+    done
+}
+
+# Send literal text to a pane (uses -l flag to avoid key name interpretation).
+send_text() {
+    local pane="$1" text="$2"
+    if [[ "$HAS_TMUX" != "true" ]]; then
+        log "send_text skipped (no tmux)"
+        return 0
+    fi
+    [[ -z "$pane" || "$pane" == "unknown" || "$pane" == "no-tmux" ]] && return 0
+    tmux send-keys -t "$pane" -l "$text" 2>/dev/null || true
+    tmux send-keys -t "$pane" Enter 2>/dev/null || true
+}
+
+# ── Dialog: permission prompt ─────────────────────────────────────────────────
+# Shows a 3-button dialog.  Returns "Allow Once", "Always Allow", or "Deny".
+# Navigates the Claude Code permission menu via arrow keys + Enter.
+# Option order assumed: Allow once (top/default) → Always allow → Deny.
+show_permission_dialog() {
+    local pane="$1" title="$2" message="$3"
+    local st sm
+    st=$(as_escape "$title")
+    sm=$(as_escape "$message")
+
+    local result
+    result=$(osascript 2>/dev/null <<APPL
+tell application "System Events" to activate
+try
+    set dlg to display dialog "$sm" ¬
+        with title "$st" ¬
+        with icon caution ¬
+        buttons {"Deny", "Allow Once", "Always Allow"} ¬
+        default button "Allow Once" ¬
+        giving up after 120
+    if gave up of dlg then return "Allow Once"
+    return button returned of dlg
+on error
+    return "Deny"
+end try
+APPL
+    ) || result="Deny"
+
+    log "Permission result: '$result' → pane $pane"
+
+    case "$result" in
+        "Always Allow")
+            # Navigate down once from the default (Allow once) to Always allow, then Enter
+            send_keys "$pane" Down Enter
+            ;;
+        "Deny")
+            # Navigate down twice to Deny, then Enter
+            send_keys "$pane" Down Down Enter
+            ;;
+        *)  # "Allow Once" or timeout — just press Enter on the default selection
+            send_keys "$pane" Enter
+            ;;
+    esac
+
+    sleep 0.3
+    focus_pane "$pane"
+}
+
+# ── Dialog: question / elicitation ───────────────────────────────────────────
+# Shows a text-input dialog.  The typed text is sent to the Claude pane.
+show_question_dialog() {
+    local pane="$1" title="$2" message="$3"
+    local st sm
+    st=$(as_escape "$title")
+    sm=$(as_escape "$message")
+
+    local result
+    result=$(osascript 2>/dev/null <<APPL
+tell application "System Events" to activate
+try
+    set dlg to display dialog "$sm" ¬
+        with title "$st" ¬
+        default answer "" ¬
+        buttons {"Skip", "Send"} ¬
+        default button "Send" ¬
+        giving up after 120
+    if gave up of dlg then return ""
+    if button returned of dlg is "Send" then
+        return text returned of dlg
+    else
+        return ""
+    end if
+on error
+    return ""
+end try
+APPL
+    ) || result=""
+
+    log "Question result: '${result:0:80}' → pane $pane"
+
+    if [[ -n "$result" ]]; then
+        # Send the typed text (literal) followed by Enter
+        send_text "$pane" "$result"
+        sleep 0.3
+        focus_pane "$pane"
+    else
+        # User skipped — just bring the pane into view
+        focus_pane "$pane"
+    fi
+}
+
+# ── Dialog: plan approval ─────────────────────────────────────────────────────
+show_approval_dialog() {
+    local pane="$1" title="$2" message="$3"
+    local st sm
+    st=$(as_escape "$title")
+    sm=$(as_escape "$message")
+
+    local result
+    result=$(osascript 2>/dev/null <<APPL
+tell application "System Events" to activate
+try
+    set dlg to display dialog "$sm" ¬
+        with title "$st" ¬
+        with icon note ¬
+        buttons {"No", "Yes, Proceed"} ¬
+        default button "Yes, Proceed" ¬
+        giving up after 120
+    if gave up of dlg then return "timeout"
+    return button returned of dlg
+on error
+    return "No"
+end try
+APPL
+    ) || result="No"
+
+    log "Approval result: '$result' → pane $pane"
+
+    case "$result" in
+        "Yes, Proceed"|timeout) send_keys "$pane" y Enter ;;
+        *)                      send_keys "$pane" n Enter ;;
+    esac
+
+    sleep 0.3
+    focus_pane "$pane"
+}
+
+# ── Process a single queue file ───────────────────────────────────────────────
+process_queue_item() {
+    local file="$1"
+    [[ ! -f "$file" ]] && return 0
+
+    local pane type title message
+    pane=$(sed -n 's/^pane=//p'    "$file" | head -1)
+    type=$(sed -n 's/^type=//p'    "$file" | head -1)
+    title=$(sed -n 's/^title=//p'  "$file" | head -1)
+    message=$(sed -n 's/^message=//p' "$file" | head -1)
+
+    log "Showing popup: type=$type pane=${pane:-unknown} tmux=$HAS_TMUX"
+
+    case "$type" in
+        permission)
+            show_permission_dialog \
+                "$pane" \
+                "${title:-Claude needs permission}" \
+                "${message:-Allow this tool?}"
+            ;;
+        question)
+            show_question_dialog \
+                "$pane" \
+                "${title:-Claude has a question}" \
+                "${message:-Type your response:}"
+            ;;
+        plan_approval)
+            show_approval_dialog \
+                "$pane" \
+                "${title:-Claude plan ready}" \
+                "${message:-Approve this plan and proceed?}"
+            ;;
+        *)
+            # Informational only — just surface a macOS notification
+            local st sm
+            st=$(as_escape "${title:-Claude}")
+            sm=$(as_escape "${message:-Needs attention}")
+            osascript -e "display notification \"$sm\" with title \"$st\" sound name \"Glass\"" 2>/dev/null || true
+            ;;
+    esac
+
+    rm -f "$file"
+    log "Queue item processed: $(basename "$file")"
+}
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+run_daemon() {
+    trap 'rm -f "$POPUP_PID_FILE"; log "Popup daemon stopped"; exit 0' INT TERM
+    echo $$ > "$POPUP_PID_FILE"
+    log "Popup daemon started (PID: $$, tmux: $HAS_TMUX)"
+
+    while true; do
+        # Pick the oldest .popup file (ls -tr = reverse-time = oldest first)
+        local oldest
+        oldest=$(ls -tr "$QUEUE_DIR"/*.popup 2>/dev/null | head -1 || true)
+
+        if [[ -n "$oldest" && -f "$oldest" ]]; then
+            process_queue_item "$oldest"
+        else
+            sleep 0.5
+        fi
+    done
+}
+
+run_daemon

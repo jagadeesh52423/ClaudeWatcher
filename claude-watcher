@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 #
-# claude-watcher - Monitor Claude Code sessions across tmux and alert when they need attention
+# claude-watcher - Monitor Claude Code sessions and alert when they need attention
+#
+# Works with or without tmux:
+#   - With tmux: full scanner + hooks + popup dialogs + pane auto-focus
+#   - Without tmux: hooks + popup dialogs (scanner disabled)
 #
 # Usage:
 #   claude-watcher start [-d]     Start watching (add -d for daemon/background mode)
@@ -26,15 +30,24 @@ WATCHER_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
 STATE_DIR="/tmp/claude-watcher"
 PID_FILE="$STATE_DIR/watcher.pid"
+POPUP_PID_FILE="$STATE_DIR/popup.pid"
 ALERTS_DIR="$STATE_DIR/alerts"
+QUEUE_DIR="$STATE_DIR/popup-queue"
 LOG_FILE="$STATE_DIR/watcher.log"
 SCAN_INTERVAL="${CLAUDE_WATCHER_INTERVAL:-3}"
 SOUND_FILE="${CLAUDE_WATCHER_SOUND:-/System/Library/Sounds/Glass.aiff}"
 AUTO_FOCUS="${CLAUDE_WATCHER_AUTO_FOCUS:-true}"
 COOLDOWN="${CLAUDE_WATCHER_COOLDOWN:-30}"
 ACTIVE_FILE="$STATE_DIR/active"
+POPUP_SCRIPT="$WATCHER_DIR/popup-daemon"
 
-mkdir -p "$STATE_DIR" "$ALERTS_DIR"
+mkdir -p "$STATE_DIR" "$ALERTS_DIR" "$QUEUE_DIR"
+
+# Detect tmux availability
+HAS_TMUX=false
+if command -v tmux &>/dev/null && tmux list-sessions &>/dev/null; then
+    HAS_TMUX=true
+fi
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 
@@ -64,12 +77,16 @@ detect_terminal_app() {
         end tell
         if appList contains "iTerm2" then
             return "iTerm2"
-        else if appList contains "Terminal" then
-            return "Terminal"
         else if appList contains "Alacritty" then
             return "Alacritty"
         else if appList contains "kitty" then
             return "kitty"
+        else if appList contains "WezTerm" then
+            return "WezTerm"
+        else if appList contains "Hyper" then
+            return "Hyper"
+        else if appList contains "Terminal" then
+            return "Terminal"
         else
             return "Terminal"
         end if
@@ -84,12 +101,12 @@ activate_terminal() {
 }
 
 # ── tmux helpers ─────────────────────────────────────────────────────────────
+# These functions are no-ops when tmux is not available.
 
 # Find all tmux panes running Claude Code
-# pane_pid is the shell process; pane_current_command shows what's actively running.
-# Claude shows as "node" or its version string (e.g. "2.1.63").
-# We verify by checking if a child process of pane_pid is "claude".
 find_claude_panes() {
+    [[ "$HAS_TMUX" != "true" ]] && return 0
+
     tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}|#{pane_pid}|#{pane_current_command}|#{session_attached}' 2>/dev/null | while IFS='|' read -r pane pid cmd attached; do
         # Quick filter: skip panes clearly not running claude (plain bash/vim/etc)
         if [[ "$cmd" == "bash" || "$cmd" == "zsh" || "$cmd" == "vim" || "$cmd" == "nvim" || "$cmd" == "ssh" ]]; then
@@ -104,13 +121,19 @@ find_claude_panes() {
 
 # Get our own tmux pane (to skip it in scanning)
 get_own_pane() {
-    tmux display-message -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || echo ""
+    if [[ "$HAS_TMUX" == "true" ]]; then
+        tmux display-message -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || echo ""
+    else
+        echo ""
+    fi
 }
 
 # ── State detection ──────────────────────────────────────────────────────────
 
 detect_pane_state() {
     local pane="$1"
+    [[ "$HAS_TMUX" != "true" ]] && { echo "unknown"; return; }
+
     local content
     content=$(tmux capture-pane -t "$pane" -p -S -30 2>/dev/null || true)
 
@@ -123,7 +146,6 @@ detect_pane_state() {
     last_lines=$(echo "$content" | tail -25)
 
     # ── Priority 1: Permission prompt ──
-    # Claude shows "Allow once", "Always allow", "Deny" as selectable options
     if echo "$last_lines" | grep -qE '(Allow once|Always allow|Allow for this|allow for this session)'; then
         if echo "$last_lines" | grep -q 'Deny'; then
             echo "permission"
@@ -132,14 +154,10 @@ detect_pane_state() {
     fi
 
     # ── Priority 2: Question / Elicitation ──
-    # AskUserQuestion shows options with ❯ selector and "Other" at the bottom
-    # Pattern: lines with selectable options preceded by a question
     if echo "$last_lines" | grep -qE '^\s+❯\s+\S' 2>/dev/null; then
-        # Check it's a question dialog (has multiple options, not the main prompt)
         local option_count
         option_count=$(echo "$last_lines" | grep -cE '^\s+(❯\s+)?\S' 2>/dev/null || echo 0)
         if [[ $option_count -ge 3 ]]; then
-            # Likely a selection dialog
             if echo "$last_lines" | grep -qE '(Other|\(Recommended\))$' 2>/dev/null; then
                 echo "question"
                 return
@@ -155,7 +173,6 @@ detect_pane_state() {
 
     # ── Priority 4: Interrupted ──
     if echo "$last_lines" | grep -q 'Interrupted'; then
-        # Check if it's recent (near the bottom)
         if echo "$content" | tail -10 | grep -q 'Interrupted'; then
             echo "interrupted"
             return
@@ -163,9 +180,7 @@ detect_pane_state() {
     fi
 
     # ── Priority 5: Idle ──
-    # The bottom status line shows "? for shortcuts" or "⏵⏵ accept edits"
     if echo "$last_lines" | grep -qE '(\? for shortcuts|⏵⏵ accept edits)'; then
-        # Check if the prompt line is empty
         local prompt_line
         prompt_line=$(echo "$content" | grep -E '^❯' | tail -1 || true)
         if [[ -z "$prompt_line" ]] || [[ "${prompt_line}" =~ ^❯[[:space:]]*$ ]]; then
@@ -189,7 +204,6 @@ send_notification() {
 
     osascript -e "display notification \"$message\" with title \"$title\" subtitle \"$subtitle\" sound name \"Glass\"" 2>/dev/null &
 
-    # Backup sound in case notification sound doesn't play
     if [[ -f "$SOUND_FILE" ]]; then
         afplay "$SOUND_FILE" 2>/dev/null &
     fi
@@ -201,18 +215,20 @@ send_notification() {
 
 focus_pane() {
     local pane="$1"
-    local session="${pane%%:*}"
-    local win_pane="${pane#*:}"
 
-    # Bring terminal app to macOS foreground
+    # Always bring terminal app to macOS foreground
     activate_terminal
 
-    # Switch tmux to the right session/window/pane
-    tmux switch-client -t "$session" 2>/dev/null || true
-    tmux select-window -t "$session:${win_pane%%.*}" 2>/dev/null || true
-    tmux select-pane -t "$pane" 2>/dev/null || true
+    # If tmux is available, switch to the right session/window/pane
+    if [[ "$HAS_TMUX" == "true" && -n "$pane" && "$pane" != "unknown" && "$pane" != "no-tmux" ]]; then
+        local session="${pane%%:*}"
+        local win_pane="${pane#*:}"
+        tmux switch-client -t "$session" 2>/dev/null || true
+        tmux select-window -t "$session:${win_pane%%.*}" 2>/dev/null || true
+        tmux select-pane -t "$pane" 2>/dev/null || true
+    fi
 
-    log "FOCUS: $pane"
+    log "FOCUS: ${pane:-terminal}"
 }
 
 # ── Alert cooldown ───────────────────────────────────────────────────────────
@@ -244,9 +260,11 @@ clear_alert() {
     rm -f "$alert_file"
 }
 
-# ── Scanner ──────────────────────────────────────────────────────────────────
+# ── Scanner (tmux only) ─────────────────────────────────────────────────────
 
 scan_once() {
+    [[ "$HAS_TMUX" != "true" ]] && return 0
+
     local our_pane
     our_pane=$(get_own_pane)
 
@@ -293,12 +311,39 @@ scan_once() {
 run_loop() {
     trap 'rm -f "$PID_FILE"; log "Watcher stopped"; exit 0' INT TERM
     echo $$ > "$PID_FILE"
-    log "Watcher started (PID: $$, interval: ${SCAN_INTERVAL}s)"
+    log "Watcher started (PID: $$, interval: ${SCAN_INTERVAL}s, tmux: $HAS_TMUX)"
 
     while true; do
         scan_once 2>/dev/null || true
         sleep "$SCAN_INTERVAL"
     done
+}
+
+start_popup_daemon() {
+    if [[ ! -f "$POPUP_SCRIPT" ]]; then
+        log "popup-daemon script not found at $POPUP_SCRIPT — skipping"
+        return 0
+    fi
+    if [[ -f "$POPUP_PID_FILE" ]] && kill -0 "$(cat "$POPUP_PID_FILE")" 2>/dev/null; then
+        return 0  # already running
+    fi
+    chmod +x "$POPUP_SCRIPT"
+    nohup "$POPUP_SCRIPT" >> "$LOG_FILE" 2>&1 &
+    echo $! > "$POPUP_PID_FILE"
+    log "Popup daemon started (PID: $!)"
+}
+
+stop_popup_daemon() {
+    if [[ ! -f "$POPUP_PID_FILE" ]]; then
+        return 0
+    fi
+    local pid
+    pid=$(cat "$POPUP_PID_FILE")
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid"
+        log "Popup daemon stopped (PID: $pid)"
+    fi
+    rm -f "$POPUP_PID_FILE"
 }
 
 cmd_start() {
@@ -313,29 +358,54 @@ cmd_start() {
         return 1
     fi
 
-    local pane_count
-    pane_count=$(find_claude_panes | wc -l | tr -d ' ')
+    local pane_count=0
+    if [[ "$HAS_TMUX" == "true" ]]; then
+        pane_count=$(find_claude_panes | wc -l | tr -d ' ')
+    fi
 
     if $daemon; then
         echo -e "${GREEN}Starting Claude Watcher daemon...${NC}"
-        nohup "$0" _loop >> "$LOG_FILE" 2>&1 &
-        local pid=$!
-        echo $pid > "$PID_FILE"
-        echo -e "${GREEN}  Started${NC} (PID: $pid)"
-        echo -e "${DIM}  Monitoring $pane_count Claude session(s)${NC}"
-        echo -e "${DIM}  Scan interval: ${SCAN_INTERVAL}s | Auto-focus: $AUTO_FOCUS${NC}"
+        if [[ "$HAS_TMUX" == "true" ]]; then
+            nohup "$0" _loop >> "$LOG_FILE" 2>&1 &
+            local pid=$!
+            echo $pid > "$PID_FILE"
+            echo -e "${GREEN}  Scanner started${NC} (PID: $pid)"
+            echo -e "${DIM}  Monitoring $pane_count Claude session(s) in tmux${NC}"
+            echo -e "${DIM}  Scan interval: ${SCAN_INTERVAL}s | Auto-focus: $AUTO_FOCUS${NC}"
+        else
+            echo -e "${DIM}  Scanner skipped (tmux not available)${NC}"
+        fi
+        start_popup_daemon
+        echo -e "${GREEN}  Popup daemon started${NC} (PID: $(cat "$POPUP_PID_FILE" 2>/dev/null || echo '?'))"
+        echo -e "${GREEN}  Hooks active${NC} (PermissionRequest + Elicitation respond via GUI popup)"
         echo -e "${DIM}  Log: $LOG_FILE${NC}"
     else
         echo -e "${BOLD}Claude Watcher${NC} ${DIM}(Ctrl+C to stop)${NC}"
-        echo -e "${DIM}Monitoring $pane_count Claude session(s) | Scan: ${SCAN_INTERVAL}s | Auto-focus: $AUTO_FOCUS${NC}"
+        if [[ "$HAS_TMUX" == "true" ]]; then
+            echo -e "${DIM}Monitoring $pane_count Claude session(s) in tmux | Scan: ${SCAN_INTERVAL}s | Auto-focus: $AUTO_FOCUS${NC}"
+        else
+            echo -e "${DIM}Hooks mode (no tmux) — popup dialogs for permissions & questions${NC}"
+        fi
         echo ""
-        run_loop
+        start_popup_daemon
+        if [[ "$HAS_TMUX" == "true" ]]; then
+            run_loop
+        else
+            # No scanner loop needed — just keep the popup daemon alive
+            trap 'stop_popup_daemon; rm -f "$ACTIVE_FILE"; log "Watcher stopped (no-tmux)"; exit 0' INT TERM
+            log "Watcher started in hooks-only mode (no tmux)"
+            echo -e "${DIM}Running in hooks-only mode. Popup daemon handles GUI dialogs.${NC}"
+            echo -e "${DIM}Press Ctrl+C to stop.${NC}"
+            while true; do sleep 5; done
+        fi
     fi
 }
 
 cmd_stop() {
     # Remove active flag so hooks stop sending notifications
     rm -f "$ACTIVE_FILE"
+
+    stop_popup_daemon
 
     if [[ ! -f "$PID_FILE" ]]; then
         echo -e "${GREEN}Notifications disabled${NC}"
@@ -358,41 +428,59 @@ cmd_stop() {
 
 cmd_status() {
     echo ""
-    echo -e "  ${BOLD}Claude Watcher - Session Status${NC}"
+    echo -e "  ${BOLD}Claude Watcher - Status${NC}"
     echo -e "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
 
     local count=0
     local attention_count=0
-    local our_pane
-    our_pane=$(get_own_pane)
 
-    while IFS='|' read -r pane pid attached; do
-        count=$((count + 1))
-        local state
-        state=$(detect_pane_state "$pane")
+    if [[ "$HAS_TMUX" == "true" ]]; then
+        local our_pane
+        our_pane=$(get_own_pane)
 
-        local icon color label
-        case "$state" in
-            permission)    icon="⚠ " ; color="$RED"     ; label="NEEDS PERMISSION"  ; attention_count=$((attention_count + 1)) ;;
-            question)      icon="? " ; color="$YELLOW"   ; label="ASKING QUESTION"   ; attention_count=$((attention_count + 1)) ;;
-            plan_approval) icon="📋" ; color="$YELLOW"   ; label="PLAN APPROVAL"     ; attention_count=$((attention_count + 1)) ;;
-            interrupted)   icon="⏸ " ; color="$MAGENTA"  ; label="INTERRUPTED"       ; attention_count=$((attention_count + 1)) ;;
-            idle)          icon="◯ " ; color="$CYAN"     ; label="IDLE"              ;;
-            idle_with_input) icon="◎ " ; color="$BLUE"   ; label="HAS INPUT"         ;;
-            working)       icon="● " ; color="$GREEN"    ; label="WORKING"           ;;
-            *)             icon="? " ; color="$DIM"      ; label="UNKNOWN"           ;;
-        esac
+        while IFS='|' read -r pane pid attached; do
+            count=$((count + 1))
+            local state
+            state=$(detect_pane_state "$pane")
 
-        local suffix=""
-        [[ "$pane" == "$our_pane" ]] && suffix=" ${DIM}← you${NC}"
+            local icon color label
+            case "$state" in
+                permission)    icon="⚠ " ; color="$RED"     ; label="NEEDS PERMISSION"  ; attention_count=$((attention_count + 1)) ;;
+                question)      icon="? " ; color="$YELLOW"   ; label="ASKING QUESTION"   ; attention_count=$((attention_count + 1)) ;;
+                plan_approval) icon="📋" ; color="$YELLOW"   ; label="PLAN APPROVAL"     ; attention_count=$((attention_count + 1)) ;;
+                interrupted)   icon="⏸ " ; color="$MAGENTA"  ; label="INTERRUPTED"       ; attention_count=$((attention_count + 1)) ;;
+                idle)          icon="◯ " ; color="$CYAN"     ; label="IDLE"              ;;
+                idle_with_input) icon="◎ " ; color="$BLUE"   ; label="HAS INPUT"         ;;
+                working)       icon="● " ; color="$GREEN"    ; label="WORKING"           ;;
+                *)             icon="? " ; color="$DIM"      ; label="UNKNOWN"           ;;
+            esac
 
-        printf "  ${color}%s${NC} ${BOLD}%-28s${NC} ${color}%-18s${NC}%s\n" \
-            "$icon" "$pane" "$label" "$suffix"
-    done < <(find_claude_panes)
+            local suffix=""
+            [[ "$pane" == "$our_pane" ]] && suffix=" ${DIM}← you${NC}"
 
-    if [[ $count -eq 0 ]]; then
-        echo -e "  ${DIM}No Claude sessions found in tmux${NC}"
+            printf "  ${color}%s${NC} ${BOLD}%-28s${NC} ${color}%-18s${NC}%s\n" \
+                "$icon" "$pane" "$label" "$suffix"
+        done < <(find_claude_panes)
+
+        if [[ $count -eq 0 ]]; then
+            echo -e "  ${DIM}No Claude sessions found in tmux${NC}"
+        fi
+    else
+        echo -e "  ${DIM}tmux not available — session scanning disabled${NC}"
+
+        # Show Claude processes running in any terminal
+        local claude_procs
+        claude_procs=$(pgrep -af "claude" 2>/dev/null | grep -v "claude-watcher\|popup-daemon\|on-claude-notify" || true)
+        if [[ -n "$claude_procs" ]]; then
+            echo -e "  ${DIM}Claude processes detected:${NC}"
+            while IFS= read -r proc; do
+                echo -e "    ${GREEN}●${NC} ${DIM}$proc${NC}"
+                count=$((count + 1))
+            done <<< "$claude_procs"
+        else
+            echo -e "  ${DIM}No Claude processes detected${NC}"
+        fi
     fi
 
     echo ""
@@ -403,10 +491,28 @@ cmd_status() {
     else
         echo -e "  ${DIM}○ Notifications: disabled${NC} (run 'claude-watcher start' to enable)"
     fi
-    if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        echo -e "  ${GREEN}●${NC} Scanner daemon: ${GREEN}running${NC} (PID: $(cat "$PID_FILE"))"
+    if [[ "$HAS_TMUX" == "true" ]]; then
+        if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+            echo -e "  ${GREEN}●${NC} Scanner daemon: ${GREEN}running${NC} (PID: $(cat "$PID_FILE"))"
+        else
+            echo -e "  ${DIM}○ Scanner daemon: not running${NC}"
+        fi
     else
-        echo -e "  ${DIM}○ Scanner daemon: not running${NC}"
+        echo -e "  ${DIM}○ Scanner daemon: N/A (no tmux)${NC}"
+    fi
+    if [[ -f "$POPUP_PID_FILE" ]] && kill -0 "$(cat "$POPUP_PID_FILE")" 2>/dev/null; then
+        local queue_count
+        queue_count=$(ls "$QUEUE_DIR"/*.popup 2>/dev/null | wc -l | tr -d ' ')
+        echo -e "  ${GREEN}●${NC} Popup daemon:   ${GREEN}running${NC} (PID: $(cat "$POPUP_PID_FILE")) | queue: $queue_count"
+    else
+        echo -e "  ${DIM}○ Popup daemon:   not running${NC}"
+    fi
+
+    # Mode info
+    if [[ "$HAS_TMUX" == "true" ]]; then
+        echo -e "  ${DIM}  Mode: full (scanner + hooks + popup)${NC}"
+    else
+        echo -e "  ${DIM}  Mode: hooks-only (popup dialogs for permissions & questions)${NC}"
     fi
 
     # Summary
@@ -425,6 +531,12 @@ cmd_focus() {
     if [[ -n "$target" ]]; then
         focus_pane "$target"
         echo -e "${GREEN}Focused: $target${NC}"
+        return
+    fi
+
+    if [[ "$HAS_TMUX" != "true" ]]; then
+        activate_terminal
+        echo -e "${GREEN}Terminal activated${NC}"
         return
     fi
 
@@ -463,46 +575,51 @@ cmd_install() {
         return 1
     fi
 
-    node -e "
+    node << NODESCRIPT
         const fs = require('fs');
         const settings = JSON.parse(fs.readFileSync('$settings_file', 'utf8'));
+        const cmd = '$hook_script';
 
         settings.hooks = settings.hooks || {};
 
-        // ── Notification hook (permission_prompt only) ──
-        settings.hooks.Notification = (settings.hooks.Notification || []).filter(
-            h => !h.hooks?.some(c => c.command?.includes('on-claude-notify'))
-        );
-        settings.hooks.Notification.push({
-            matcher: 'permission_prompt',
-            hooks: [{ type: 'command', command: '$hook_script' }]
-        });
+        function addHook(eventName, matcher) {
+            const existing = settings.hooks[eventName] || [];
+            settings.hooks[eventName] = existing.filter(function(h) {
+                var hasOurs = h.hooks && h.hooks.some(function(c) {
+                    return c.command && c.command.includes('on-claude-notify');
+                });
+                return !hasOurs;
+            });
+            settings.hooks[eventName].push({
+                matcher: matcher,
+                hooks: [{ type: 'command', command: cmd }]
+            });
+        }
 
-        // ── Elicitation hook (questions) ──
-        settings.hooks.Elicitation = (settings.hooks.Elicitation || []).filter(
-            h => !h.hooks?.some(c => c.command?.includes('on-claude-notify'))
-        );
-        settings.hooks.Elicitation.push({
-            matcher: '',
-            hooks: [{ type: 'command', command: '$hook_script' }]
-        });
+        // PreToolUse: Claude reads allow/deny decisions from stdout
+        addHook('PreToolUse', '');
 
-        // ── PermissionRequest hook ──
-        settings.hooks.PermissionRequest = (settings.hooks.PermissionRequest || []).filter(
-            h => !h.hooks?.some(c => c.command?.includes('on-claude-notify'))
-        );
-        settings.hooks.PermissionRequest.push({
-            matcher: '',
-            hooks: [{ type: 'command', command: '$hook_script' }]
-        });
+        // Notification: macOS notification for permission_prompt
+        addHook('Notification', 'permission_prompt');
+
+        // Elicitation: text-input dialog, response via stdout
+        addHook('Elicitation', '');
+
+        // PermissionRequest: fallback focus
+        addHook('PermissionRequest', '');
 
         fs.writeFileSync('$settings_file', JSON.stringify(settings, null, 2));
-    "
+NODESCRIPT
 
     echo -e "${GREEN}Hooks installed successfully!${NC}"
     echo -e "${DIM}  Settings: $settings_file${NC}"
     echo -e "${DIM}  Handler:  $hook_script${NC}"
     echo ""
+    if [[ "$HAS_TMUX" == "true" ]]; then
+        echo -e "  ${DIM}Mode: full (scanner + hooks + popup dialogs)${NC}"
+    else
+        echo -e "  ${DIM}Mode: hooks-only (works in any terminal — no tmux required)${NC}"
+    fi
     echo -e "  ${YELLOW}Note: Restart running Claude sessions for hooks to take effect.${NC}"
 }
 
@@ -532,24 +649,28 @@ cmd_uninstall() {
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 case "${1:-help}" in
-    start)     cmd_start "${2:-}" ;;
-    stop)      cmd_stop ;;
-    status|s)  cmd_status ;;
-    focus|f)   cmd_focus "${2:-}" ;;
-    install)   cmd_install ;;
-    uninstall) cmd_uninstall ;;
-    _loop)     run_loop ;;
+    start)          cmd_start "${2:-}" ;;
+    stop)           cmd_stop ;;
+    status|s)       cmd_status ;;
+    focus|f)        cmd_focus "${2:-}" ;;
+    install)        cmd_install ;;
+    uninstall)      cmd_uninstall ;;
+    popup-daemon)   start_popup_daemon; echo -e "${GREEN}Popup daemon started${NC} (PID: $(cat "$POPUP_PID_FILE"))" ;;
+    popup-stop)     stop_popup_daemon;  echo -e "${GREEN}Popup daemon stopped${NC}" ;;
+    _loop)          run_loop ;;
     help|--help|-h)
         echo ""
-        echo -e "  ${BOLD}claude-watcher${NC} — Monitor Claude Code sessions across tmux"
+        echo -e "  ${BOLD}claude-watcher${NC} — Monitor Claude Code sessions"
         echo ""
         echo -e "  ${BOLD}COMMANDS${NC}"
-        echo -e "    start [-d]     Start watching (-d for daemon mode)"
-        echo -e "    stop           Stop the background watcher"
+        echo -e "    start [-d]     Start watching (-d for daemon mode) + popup daemon"
+        echo -e "    stop           Stop watcher and popup daemon"
         echo -e "    status         Show all Claude sessions and their state"
         echo -e "    focus [pane]   Bring terminal to front, switch to alerting pane"
         echo -e "    install        Install Claude Code notification hooks"
         echo -e "    uninstall      Remove hooks from Claude settings"
+        echo -e "    popup-daemon   Start only the popup daemon"
+        echo -e "    popup-stop     Stop only the popup daemon"
         echo ""
         echo -e "  ${BOLD}ENVIRONMENT${NC}"
         echo -e "    CLAUDE_WATCHER_INTERVAL     Scan interval in seconds (default: 3)"
@@ -558,9 +679,18 @@ case "${1:-help}" in
         echo -e "    CLAUDE_WATCHER_COOLDOWN     Repeat alert cooldown in seconds (default: 30)"
         echo ""
         echo -e "  ${BOLD}HOW IT WORKS${NC}"
-        echo -e "    Two detection methods work together:"
-        echo -e "    1. ${GREEN}Hooks${NC} (real-time): Claude fires events → instant notification"
-        echo -e "    2. ${GREEN}Scanner${NC} (polling): Scans tmux panes every few seconds"
+        echo -e "    Works in two modes depending on your environment:"
+        echo ""
+        echo -e "    ${GREEN}Hooks-only mode${NC} (any terminal, no tmux needed):"
+        echo -e "      Claude fires hook events → GUI popup dialogs → response via stdout"
+        echo -e "      PermissionRequest → 3-button dialog (Allow/Deny/Always Allow)"
+        echo -e "      Elicitation       → text-input dialog, answer sent to Claude"
+        echo ""
+        echo -e "    ${GREEN}Full mode${NC} (with tmux):"
+        echo -e "      All of the above, plus:"
+        echo -e "      Scanner polls tmux panes every ${SCAN_INTERVAL}s for attention indicators"
+        echo -e "      Auto-focus switches to the exact tmux pane needing attention"
+        echo -e "      Popup queue processes scanner-detected events (FIFO)"
         echo ""
         echo -e "  ${BOLD}QUICK START${NC}"
         echo -e "    claude-watcher install       # Set up Claude hooks"
