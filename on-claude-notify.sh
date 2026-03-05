@@ -6,19 +6,21 @@
 #   returns hookSpecificOutput with decision.behavior = allow/deny.
 #   Supports "Always Allow" via updatedPermissions from permission_suggestions.
 #
-# PreToolUse — fires for ALL tool calls. For AskUserQuestion/ExitPlanMode,
-#   shows dynamic options popup and sends selection via tmux.
-#   For all others, exits 0 silently (let normal permission system handle it).
+# PreToolUse — exits 0 silently (PermissionRequest handles popups).
+#
+# Elicitation — dynamic options or free-text popup.
 #
 # Notification — fire-and-forget macOS notification.
 #
+# Uses popup-gui.js (JXA/Cocoa NSAlert) for professional native dialogs.
 # Works with or without tmux.
 #
 
 STATE_DIR="/tmp/claude-watcher"
 LOG_FILE="$STATE_DIR/watcher.log"
-AUTO_FOCUS="${CLAUDE_WATCHER_AUTO_FOCUS:-true}"
 ACTIVE_FILE="$STATE_DIR/active"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GUI_SCRIPT="$SCRIPT_DIR/popup-gui.js"
 
 mkdir -p "$STATE_DIR"
 
@@ -35,19 +37,14 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] HOOK: $*" >> "$LOG_FILE"
 }
 
-as_escape() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
 
 # ── Read + parse payload in one node call ─────────────────────────────────────
 
 payload=$(cat)
 [[ -z "$payload" ]] && exit 0
 
-# Single node call extracts everything we need.
-# Payload is passed via stdin (not argv) to avoid shell metacharacter issues
-# with $(), backticks, etc. in tool_input commands.
-# Node writes to a temp file; we source it (no eval of stdout).
+# Payload is passed via stdin to node (not argv) to avoid shell metacharacter
+# issues. Node writes shell assignments to a temp file; we source it.
 _parse_tmp=$(mktemp)
 _script_tmp=$(mktemp)
 cat > "$_script_tmp" << 'NODESCRIPT'
@@ -85,7 +82,6 @@ if ((p.tool_name || "") === "AskUserQuestion" && ti.questions && ti.questions[0]
 
 // 2. Elicitation: top-level or nested questions/options
 if (optLabels.length === 0 && (p.hook_event_name || "") === "Elicitation") {
-    // Try p.questions[0].options
     if (p.questions && p.questions[0]) {
         const q = p.questions[0];
         qText = q.question || q.header || q.prompt || p.message || "";
@@ -93,14 +89,12 @@ if (optLabels.length === 0 && (p.hook_event_name || "") === "Elicitation") {
             optLabels.push(o.label || o.value || String(o));
         });
     }
-    // Try p.options directly
     if (optLabels.length === 0 && Array.isArray(p.options)) {
         qText = p.message || p.prompt || "";
         p.options.forEach((o) => {
             optLabels.push(typeof o === "string" ? o : (o.label || o.value || String(o)));
         });
     }
-    // Fallback: use message/prompt as question text even if no options
     if (!qText) qText = p.message || p.prompt || "";
 }
 
@@ -114,7 +108,7 @@ if (optLabels.length === 0 && ti.options && Array.isArray(ti.options)) {
 
 const psJson = ps.length > 0 ? JSON.stringify(ps) : "";
 
-// Single-quote wrap: replace ' with '\'' for safe shell sourcing
+// Single-quote wrap for safe shell sourcing
 const sq = s => "'" + String(s).replace(/'/g, "'\\''") + "'";
 
 console.log("hook_event=" + sq(p.hook_event_name || ""));
@@ -128,6 +122,44 @@ console.log("question_text=" + sq(qText));
 console.log("option_labels=" + sq(optLabels.join("|")));
 console.log("option_count=" + optLabels.length);
 console.log("perm_suggestions=" + sq(psJson));
+
+// Pre-build GUI params JSON files (proper JSON.stringify — no shell escaping needed)
+const cwd = p.cwd || "";
+const proj = cwd ? require("path").basename(cwd) : "";
+const toolName = p.tool_name || "";
+
+// Options dialog params
+if (optLabels.length > 0) {
+    const optGui = JSON.stringify({
+        type: "options",
+        title: "Claude Code" + (toolName ? " — " + toolName : ""),
+        message: qText || "Choose an option:",
+        options: optLabels
+    });
+    fs.writeFileSync(logDir + "/gui-options.json", optGui);
+    console.log("gui_options_file=" + sq(logDir + "/gui-options.json"));
+} else {
+    console.log("gui_options_file=''");
+}
+
+// Permission dialog params
+const permGui = JSON.stringify({
+    type: "permission",
+    tool: toolName || "Unknown",
+    summary: ts,
+    project: proj
+});
+fs.writeFileSync(logDir + "/gui-permission.json", permGui);
+console.log("gui_permission_file=" + sq(logDir + "/gui-permission.json"));
+
+// Text dialog params
+const textGui = JSON.stringify({
+    type: "text",
+    title: "Claude Code — Question",
+    message: qText || p.message || p.prompt || "Claude is asking you a question."
+});
+fs.writeFileSync(logDir + "/gui-text.json", textGui);
+console.log("gui_text_file=" + sq(logDir + "/gui-text.json"));
 NODESCRIPT
 node "$_script_tmp" <<< "$payload" > "$_parse_tmp" 2>/dev/null
 rm -f "$_script_tmp"
@@ -159,30 +191,6 @@ find_pane_id() {
 pane=$(find_pane_id)
 project=$(basename "${cwd:-unknown}")
 
-detect_terminal_app() {
-    osascript -e '
-        tell application "System Events"
-            set appList to name of every application process whose visible is true
-        end tell
-        if appList contains "iTerm2" then return "iTerm2"
-        if appList contains "Alacritty" then return "Alacritty"
-        if appList contains "kitty" then return "kitty"
-        if appList contains "WezTerm" then return "WezTerm"
-        return "Terminal"
-    ' 2>/dev/null || echo "Terminal"
-}
-
-focus_pane() {
-    local ta
-    ta=$(detect_terminal_app)
-    osascript -e "tell application \"$ta\" to activate" 2>/dev/null || true
-    if [[ "$HAS_TMUX" == "true" && "$pane" != "unknown" && "$pane" != "no-tmux" ]]; then
-        tmux switch-client -t "${pane%%:*}" 2>/dev/null || true
-        tmux select-window -t "${pane%%.*}" 2>/dev/null || true
-        tmux select-pane -t "$pane" 2>/dev/null || true
-    fi
-}
-
 send_keys() {
     [[ "$HAS_TMUX" != "true" || "$pane" == "unknown" || "$pane" == "no-tmux" ]] && return 0
     local p="$pane"; shift
@@ -196,79 +204,48 @@ send_keys() {
 if [[ "$hook_event" == "PermissionRequest" ]]; then
 
     # ── Tool with dynamic options (e.g. AskUserQuestion) ─────────────────
-    if [[ "$option_count" -gt 0 ]]; then
+    if [[ "$option_count" -gt 0 && -n "$gui_options_file" ]]; then
         log "PermissionRequest with options: $tool_name '$question_text' ($option_count options)"
 
-        as_list=""
-        IFS='|' read -ra labels <<< "$option_labels"
-        for i in "${!labels[@]}"; do
-            [[ -n "$as_list" ]] && as_list+=", "
-            as_list+="\"$((i+1)). $(as_escape "${labels[$i]}")\""
-        done
-        as_list+=", \"$((${#labels[@]}+1)). Type something\""
-
-        sq=$(as_escape "${question_text:-Claude is asking...}")
-
-        result=$(osascript 2>/dev/null <<APPL
-tell application "System Events" to activate
-try
-    set chosen to choose from list {${as_list}} ¬
-        with title "Claude Code — $tool_name" ¬
-        with prompt "$sq" ¬
-        OK button name "Select" ¬
-        cancel button name "Skip"
-    if chosen is false then return "SKIP"
-    return item 1 of chosen
-on error
-    return "SKIP"
-end try
-APPL
-        ) || result="SKIP"
+        result=$(osascript -l JavaScript "$GUI_SCRIPT" "$gui_options_file" 2>/dev/null) || result="SKIP"
 
         log "PermissionRequest options result: '$result'"
 
-        if [[ "$result" != "SKIP" ]]; then
+        if [[ "$result" != "SKIP" && "$result" != "ERROR:"* ]]; then
             selected_num="${result%%.*}"
-            # Get the selected label
             IFS='|' read -ra sel_labels <<< "$option_labels"
             if [[ "$selected_num" -le "$option_count" ]]; then
                 selected_label="${sel_labels[$((selected_num-1))]}"
             else
                 selected_label="Other"
             fi
-            log "Selected label: '$selected_label' for question: '$question_text'"
+            log "Selected: '$selected_label' for '$question_text'"
 
-            # Use updatedInput.answers to pass the selection back through the hook response
+            # Return answer via updatedInput.answers
             _ans_tmp=$(mktemp)
             cat > "$_ans_tmp" << 'ANSSCRIPT'
-// argv: [node, script_path, question_text, answer_label]
 const qText = process.argv[2];
 const answer = process.argv[3];
-const result = {
+const r = {
     hookSpecificOutput: {
         hookEventName: "PermissionRequest",
         decision: {
             behavior: "allow",
-            updatedInput: {
-                answers: {}
-            }
+            updatedInput: { answers: {} }
         }
     }
 };
-result.hookSpecificOutput.decision.updatedInput.answers[qText] = answer;
-console.log(JSON.stringify(result));
+r.hookSpecificOutput.decision.updatedInput.answers[qText] = answer;
+console.log(JSON.stringify(r));
 ANSSCRIPT
             node "$_ans_tmp" "$question_text" "$selected_label" 2>/dev/null
             rm -f "$_ans_tmp"
         else
-            # SKIP — just allow without answer
             cat <<'ENDJSON'
 {
   "hookSpecificOutput": {
     "hookEventName": "PermissionRequest",
-    "decision": {
-      "behavior": "allow"
-    }
+    "decision": { "behavior": "allow" }
   }
 }
 ENDJSON
@@ -277,32 +254,8 @@ ENDJSON
     fi
 
     # ── Standard permission dialog (Deny / Allow Once / Always Allow) ────
-    if [[ -n "$tool_name" ]]; then
-        dialog_msg="Tool: $tool_name"
-        [[ -n "$tool_summary" ]] && dialog_msg="$dialog_msg\n\n$tool_summary"
-    else
-        dialog_msg="Claude needs your permission."
-    fi
 
-    st=$(as_escape "Claude Code — Permission")
-    sm=$(as_escape "$dialog_msg")
-
-    result=$(osascript 2>/dev/null <<APPL
-tell application "System Events" to activate
-try
-    set dlg to display dialog "$sm" ¬
-        with title "$st" ¬
-        with icon caution ¬
-        buttons {"Deny", "Allow Once", "Always Allow"} ¬
-        default button "Allow Once" ¬
-        giving up after 120
-    if gave up of dlg then return "Allow Once"
-    return button returned of dlg
-on error
-    return "Deny"
-end try
-APPL
-    ) || result="Deny"
+    result=$(osascript -l JavaScript "$GUI_SCRIPT" "$gui_permission_file" 2>/dev/null) || result="Deny"
 
     log "PermissionRequest result: '$result' for $tool_name"
 
@@ -312,9 +265,7 @@ APPL
 {
   "hookSpecificOutput": {
     "hookEventName": "PermissionRequest",
-    "decision": {
-      "behavior": "allow"
-    }
+    "decision": { "behavior": "allow" }
   }
 }
 ENDJSON
@@ -322,26 +273,24 @@ ENDJSON
             ;;
         "Always Allow")
             if [[ -n "$perm_suggestions" ]]; then
-                node -e '
-                    const ps = JSON.parse(process.argv[1]);
-                    console.log(JSON.stringify({
-                        hookSpecificOutput: {
-                            hookEventName: "PermissionRequest",
-                            decision: {
-                                behavior: "allow",
-                                updatedPermissions: ps
-                            }
-                        }
-                    }));
-                ' "$perm_suggestions" 2>/dev/null
+                _ps_tmp=$(mktemp)
+                cat > "$_ps_tmp" << 'PSSCRIPT'
+const ps = JSON.parse(process.argv[2]);
+console.log(JSON.stringify({
+    hookSpecificOutput: {
+        hookEventName: "PermissionRequest",
+        decision: { behavior: "allow", updatedPermissions: ps }
+    }
+}));
+PSSCRIPT
+                node "$_ps_tmp" "$perm_suggestions" 2>/dev/null
+                rm -f "$_ps_tmp"
             else
                 cat <<'ENDJSON'
 {
   "hookSpecificOutput": {
     "hookEventName": "PermissionRequest",
-    "decision": {
-      "behavior": "allow"
-    }
+    "decision": { "behavior": "allow" }
   }
 }
 ENDJSON
@@ -353,10 +302,7 @@ ENDJSON
 {
   "hookSpecificOutput": {
     "hookEventName": "PermissionRequest",
-    "decision": {
-      "behavior": "deny",
-      "message": "User denied via popup"
-    }
+    "decision": { "behavior": "deny", "message": "User denied via popup" }
   }
 }
 ENDJSON
@@ -367,8 +313,7 @@ fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PreToolUse — fires for ALL tool calls
-# Exit 0 silently; PermissionRequest handles popups (both permissions and
-# dynamic options) so we don't show duplicate dialogs.
+# Exit 0 silently; PermissionRequest handles popups.
 # ══════════════════════════════════════════════════════════════════════════════
 
 if [[ "$hook_event" == "PreToolUse" ]]; then
@@ -376,43 +321,18 @@ if [[ "$hook_event" == "PreToolUse" ]]; then
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Elicitation — Claude is asking the user a question (with or without options)
+# Elicitation — Claude is asking the user a question
 # ══════════════════════════════════════════════════════════════════════════════
 
 if [[ "$hook_event" == "Elicitation" ]]; then
-    if [[ "$option_count" -gt 0 ]]; then
-        # Has options — show choose-from-list popup
+    if [[ "$option_count" -gt 0 && -n "$gui_options_file" ]]; then
         log "Elicitation with options: '$question_text' ($option_count options)"
 
-        as_list=""
-        IFS='|' read -ra labels <<< "$option_labels"
-        for i in "${!labels[@]}"; do
-            [[ -n "$as_list" ]] && as_list+=", "
-            as_list+="\"$((i+1)). $(as_escape "${labels[$i]}")\""
-        done
-        as_list+=", \"$((${#labels[@]}+1)). Type something\""
-
-        sq=$(as_escape "${question_text:-Claude is asking...}")
-
-        result=$(osascript 2>/dev/null <<APPL
-tell application "System Events" to activate
-try
-    set chosen to choose from list {${as_list}} ¬
-        with title "Claude Code — Question" ¬
-        with prompt "$sq" ¬
-        OK button name "Select" ¬
-        cancel button name "Skip"
-    if chosen is false then return "SKIP"
-    return item 1 of chosen
-on error
-    return "SKIP"
-end try
-APPL
-        ) || result="SKIP"
+        result=$(osascript -l JavaScript "$GUI_SCRIPT" "$gui_options_file" 2>/dev/null) || result="SKIP"
 
         log "Elicitation result: '$result'"
 
-        if [[ "$result" != "SKIP" ]]; then
+        if [[ "$result" != "SKIP" && "$result" != "ERROR:"* ]]; then
             selected_num="${result%%.*}"
             (
                 sleep 0.5
@@ -431,31 +351,9 @@ APPL
             ) &
         fi
     else
-        # No options — free-text input dialog
         log "Elicitation free-text: '$question_text'"
 
-        sq=$(as_escape "${question_text:-${message:-Claude is asking you a question.}}")
-
-        result=$(osascript 2>/dev/null <<APPL
-tell application "System Events" to activate
-try
-    set dlg to display dialog "$sq" ¬
-        with title "Claude Code — Question" ¬
-        default answer "" ¬
-        buttons {"Skip", "Send"} ¬
-        default button "Send" ¬
-        giving up after 300
-    if gave up of dlg then return "__SKIP__"
-    if button returned of dlg is "Send" then
-        return text returned of dlg
-    else
-        return "__SKIP__"
-    end if
-on error
-    return "__SKIP__"
-end try
-APPL
-        ) || result="__SKIP__"
+        result=$(osascript -l JavaScript "$GUI_SCRIPT" "$gui_text_file" 2>/dev/null) || result="__SKIP__"
 
         log "Elicitation text result: '${result:0:80}'"
 
