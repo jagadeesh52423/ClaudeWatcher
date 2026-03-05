@@ -88,7 +88,7 @@ function showPermission(data) {
 }
 
 // ─── Options Dialog ──────────────────────────────────────────────────────────
-// NSAlert with radio buttons for each option + "Type something" at bottom
+// NSAlert with NSPopUpButton dropdown for single selection
 
 function showOptions(data) {
     var title = data.title || "Claude Code";
@@ -104,59 +104,56 @@ function showOptions(data) {
     alert.informativeText = $(message);
     alert.alertStyle = $.NSAlertStyleInformational;
 
-    // Build radio buttons in a container view
-    var rowHeight = 30;
-    var padding = 12;
-    var viewWidth = 400;
-    var viewHeight = allOptions.length * rowHeight + padding;
+    // Container with numbered labels + popup dropdown
+    var viewWidth = 420;
+    var popupHeight = 30;
+    var listHeight = allOptions.length * 22 + 8;
+    var viewHeight = listHeight + popupHeight + 16;
 
     var container = $.NSView.alloc.initWithFrame(
         $.NSMakeRect(0, 0, viewWidth, viewHeight)
     );
 
-    var radioGroup = [];
+    // Numbered list as static text (for visual reference)
+    var listText = "";
     for (var i = 0; i < allOptions.length; i++) {
-        var y = viewHeight - ((i + 1) * rowHeight);
-        var radio = $.NSButton.alloc.initWithFrame(
-            $.NSMakeRect(8, y, viewWidth - 16, 24)
-        );
-        radio.setButtonType($.NSButtonTypeRadio);
-
-        var label = (i + 1) + ".  " + allOptions[i];
-        radio.title = $(label);
-        radio.tag = i;
-
-        // Use slightly larger font
-        radio.font = $.NSFont.systemFontOfSize(13);
-
-        // First option selected by default
-        radio.state = (i === 0)
-            ? $.NSControlStateValueOn
-            : $.NSControlStateValueOff;
-
-        container.addSubview(radio);
-        radioGroup.push(radio);
+        listText += (i + 1) + ".  " + allOptions[i] + "\n";
     }
+    var label = $.NSTextField.alloc.initWithFrame(
+        $.NSMakeRect(8, popupHeight + 12, viewWidth - 16, listHeight)
+    );
+    label.stringValue = $(listText.trim());
+    label.editable = false;
+    label.bordered = false;
+    label.drawsBackground = false;
+    label.font = $.NSFont.systemFontOfSize(13);
+    label.selectable = false;
+    container.addSubview(label);
+
+    // Dropdown popup button at the bottom
+    var popup = $.NSPopUpButton.alloc.initWithFramePullsDown(
+        $.NSMakeRect(8, 4, viewWidth - 16, 28), false
+    );
+    popup.font = $.NSFont.systemFontOfSize(13);
+    for (var j = 0; j < allOptions.length; j++) {
+        popup.addItemWithTitle($((j + 1) + ". " + allOptions[j]));
+    }
+    container.addSubview(popup);
 
     alert.accessoryView = container;
     alert.addButtonWithTitle($("Select"));
     alert.addButtonWithTitle($("Skip"));
 
-    setMinWidth(alert, 480);
+    setMinWidth(alert, 500);
     alert.window.center;
     alert.window.setLevel($.NSStatusWindowLevel);
 
     var response = alert.runModal;
     if (response == 1000) {
-        // Find selected radio
-        for (var j = 0; j < radioGroup.length; j++) {
-            if (radioGroup[j].state == $.NSControlStateValueOn) {
-                var idx = radioGroup[j].tag;
-                return (idx + 1) + ". " + allOptions[idx];
-            }
-        }
-        // Fallback
-        return "1. " + allOptions[0];
+        var selectedIdx = popup.indexOfSelectedItem;
+        // indexOfSelectedItem could be ObjC wrapped
+        var idx = parseInt("" + selectedIdx, 10);
+        return (idx + 1) + ". " + allOptions[idx];
     }
     return "SKIP";
 }
