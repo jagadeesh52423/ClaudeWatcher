@@ -51,9 +51,18 @@ payload=$(cat)
 _parse_tmp=$(mktemp)
 _script_tmp=$(mktemp)
 cat > "$_script_tmp" << 'NODESCRIPT'
-const p = JSON.parse(require("fs").readFileSync(0, "utf8"));
+const fs = require("fs");
+const p = JSON.parse(fs.readFileSync(0, "utf8"));
 const ti = p.tool_input || {};
 const ps = p.permission_suggestions || [];
+
+// Log raw payload for debugging
+const logDir = "/tmp/claude-watcher";
+try {
+    fs.appendFileSync(logDir + "/payloads.log",
+        "[" + new Date().toISOString() + "] " + p.hook_event_name + "/" + (p.tool_name || "") + "\n" +
+        JSON.stringify(p, null, 2) + "\n---\n");
+} catch(e) {}
 
 let ts = "";
 try {
@@ -62,12 +71,44 @@ try {
     if (ts === "{}") ts = "";
 } catch(e) {}
 
+// Generic options extraction — try multiple payload locations
 let qText = "", optLabels = [];
+
+// 1. AskUserQuestion: tool_input.questions[0].options
 if ((p.tool_name || "") === "AskUserQuestion" && ti.questions && ti.questions[0]) {
     const q = ti.questions[0];
     qText = q.question || q.header || "";
     (q.options || []).forEach((o) => {
         optLabels.push(o.label || o.value || String(o));
+    });
+}
+
+// 2. Elicitation: top-level or nested questions/options
+if (optLabels.length === 0 && (p.hook_event_name || "") === "Elicitation") {
+    // Try p.questions[0].options
+    if (p.questions && p.questions[0]) {
+        const q = p.questions[0];
+        qText = q.question || q.header || q.prompt || p.message || "";
+        (q.options || []).forEach((o) => {
+            optLabels.push(o.label || o.value || String(o));
+        });
+    }
+    // Try p.options directly
+    if (optLabels.length === 0 && Array.isArray(p.options)) {
+        qText = p.message || p.prompt || "";
+        p.options.forEach((o) => {
+            optLabels.push(typeof o === "string" ? o : (o.label || o.value || String(o)));
+        });
+    }
+    // Fallback: use message/prompt as question text even if no options
+    if (!qText) qText = p.message || p.prompt || "";
+}
+
+// 3. ExitPlanMode / EnterPlanMode: tool_input may have options
+if (optLabels.length === 0 && ti.options && Array.isArray(ti.options)) {
+    qText = ti.question || ti.prompt || ti.message || p.message || "";
+    ti.options.forEach((o) => {
+        optLabels.push(typeof o === "string" ? o : (o.label || o.value || String(o)));
     });
 }
 
@@ -251,26 +292,26 @@ fi
 
 if [[ "$hook_event" == "PreToolUse" ]]; then
 
-    # ── AskUserQuestion: dynamic options popup ───────────────────────────────
-    if [[ "$tool_name" == "AskUserQuestion" && "$option_count" -gt 0 ]]; then
-        log "AskUserQuestion: '$question_text' ($option_count options)"
+    # ── Tools with dynamic options (AskUserQuestion, ExitPlanMode, etc.) ────
+    if [[ "$option_count" -gt 0 && ("$tool_name" == "AskUserQuestion" || "$tool_name" == "ExitPlanMode") ]]; then
+        log "$tool_name: '$question_text' ($option_count options)"
 
-        # Build AppleScript list
+        # Build AppleScript list from actual options
         as_list=""
         IFS='|' read -ra labels <<< "$option_labels"
         for i in "${!labels[@]}"; do
             [[ -n "$as_list" ]] && as_list+=", "
-            as_list+="\"$((i+1)). ${labels[$i]}\""
+            as_list+="\"$((i+1)). $(as_escape "${labels[$i]}")\""
         done
         as_list+=", \"$((${#labels[@]}+1)). Type something\""
 
-        sq=$(as_escape "$question_text")
+        sq=$(as_escape "${question_text:-Claude is asking...}")
 
         result=$(osascript 2>/dev/null <<APPL
 tell application "System Events" to activate
 try
     set chosen to choose from list {${as_list}} ¬
-        with title "Claude Code" ¬
+        with title "Claude Code — $tool_name" ¬
         with prompt "$sq" ¬
         OK button name "Select" ¬
         cancel button name "Skip"
@@ -282,7 +323,7 @@ end try
 APPL
         ) || result="SKIP"
 
-        log "AskUserQuestion result: '$result'"
+        log "$tool_name result: '$result'"
 
         # Allow the tool to proceed
         cat <<'ENDJSON'
@@ -305,27 +346,47 @@ ENDJSON
                     done
                     send_keys Enter
                 else
+                    # "Type something" — navigate past all options
                     for (( i=1; i<=option_count; i++ )); do
                         send_keys Down; sleep 0.1
                     done
                     send_keys Enter
                 fi
-                log "Sent AskUser selection $selected_num"
+                log "Sent $tool_name selection $selected_num"
             ) &
         fi
         exit 0
     fi
 
-    # ── ExitPlanMode: plan approval popup ────────────────────────────────────
-    if [[ "$tool_name" == "ExitPlanMode" ]]; then
-        log "ExitPlanMode: showing plan approval popup"
+    # ── All other tools: exit 0 silently (normal permission system) ──────────
+    exit 0
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Elicitation — Claude is asking the user a question (with or without options)
+# ══════════════════════════════════════════════════════════════════════════════
+
+if [[ "$hook_event" == "Elicitation" ]]; then
+    if [[ "$option_count" -gt 0 ]]; then
+        # Has options — show choose-from-list popup
+        log "Elicitation with options: '$question_text' ($option_count options)"
+
+        as_list=""
+        IFS='|' read -ra labels <<< "$option_labels"
+        for i in "${!labels[@]}"; do
+            [[ -n "$as_list" ]] && as_list+=", "
+            as_list+="\"$((i+1)). $(as_escape "${labels[$i]}")\""
+        done
+        as_list+=", \"$((${#labels[@]}+1)). Type something\""
+
+        sq=$(as_escape "${question_text:-Claude is asking...}")
 
         result=$(osascript 2>/dev/null <<APPL
 tell application "System Events" to activate
 try
-    set chosen to choose from list {"1. Yes, clear context and auto-accept edits", "2. Yes, auto-accept edits", "3. Yes, manually approve edits", "4. Type feedback"} ¬
-        with title "Claude Code — Plan Ready" ¬
-        with prompt "Claude has written a plan. How to proceed?" ¬
+    set chosen to choose from list {${as_list}} ¬
+        with title "Claude Code — Question" ¬
+        with prompt "$sq" ¬
         OK button name "Select" ¬
         cancel button name "Skip"
     if chosen is false then return "SKIP"
@@ -336,33 +397,66 @@ end try
 APPL
         ) || result="SKIP"
 
-        log "ExitPlanMode result: '$result'"
-
-        # Allow the tool
-        cat <<'ENDJSON'
-{
-  "hookSpecificOutput": {
-    "hookEventName": "PreToolUse",
-    "permissionDecision": "allow"
-  }
-}
-ENDJSON
+        log "Elicitation result: '$result'"
 
         if [[ "$result" != "SKIP" ]]; then
             selected_num="${result%%.*}"
             (
-                sleep 1.0
-                for (( i=1; i<selected_num; i++ )); do
-                    send_keys Down; sleep 0.1
-                done
-                send_keys Enter
-                log "Sent plan approval selection $selected_num"
+                sleep 0.5
+                if [[ "$selected_num" -le "$option_count" ]]; then
+                    for (( i=1; i<selected_num; i++ )); do
+                        send_keys Down; sleep 0.1
+                    done
+                    send_keys Enter
+                else
+                    for (( i=1; i<=option_count; i++ )); do
+                        send_keys Down; sleep 0.1
+                    done
+                    send_keys Enter
+                fi
+                log "Sent Elicitation selection $selected_num"
             ) &
         fi
-        exit 0
-    fi
+    else
+        # No options — free-text input dialog
+        log "Elicitation free-text: '$question_text'"
 
-    # ── All other tools: exit 0 silently (normal permission system) ──────────
+        sq=$(as_escape "${question_text:-${message:-Claude is asking you a question.}}")
+
+        result=$(osascript 2>/dev/null <<APPL
+tell application "System Events" to activate
+try
+    set dlg to display dialog "$sq" ¬
+        with title "Claude Code — Question" ¬
+        default answer "" ¬
+        buttons {"Skip", "Send"} ¬
+        default button "Send" ¬
+        giving up after 300
+    if gave up of dlg then return "__SKIP__"
+    if button returned of dlg is "Send" then
+        return text returned of dlg
+    else
+        return "__SKIP__"
+    end if
+on error
+    return "__SKIP__"
+end try
+APPL
+        ) || result="__SKIP__"
+
+        log "Elicitation text result: '${result:0:80}'"
+
+        if [[ "$result" != "__SKIP__" && -n "$result" ]]; then
+            (
+                sleep 0.5
+                if [[ "$HAS_TMUX" == "true" && "$pane" != "unknown" && "$pane" != "no-tmux" ]]; then
+                    tmux send-keys -t "$pane" -l "$result" 2>/dev/null || true
+                    tmux send-keys -t "$pane" Enter 2>/dev/null || true
+                fi
+                log "Sent Elicitation text response"
+            ) &
+        fi
+    fi
     exit 0
 fi
 
