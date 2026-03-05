@@ -352,79 +352,11 @@ fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PreToolUse — fires for ALL tool calls
-# Only intercept AskUserQuestion and ExitPlanMode for dynamic popup options.
-# Everything else: exit 0 (let normal permission system handle it).
+# Exit 0 silently; PermissionRequest handles popups (both permissions and
+# dynamic options) so we don't show duplicate dialogs.
 # ══════════════════════════════════════════════════════════════════════════════
 
 if [[ "$hook_event" == "PreToolUse" ]]; then
-
-    # ── Tools with dynamic options (AskUserQuestion, ExitPlanMode, etc.) ────
-    if [[ "$option_count" -gt 0 && ("$tool_name" == "AskUserQuestion" || "$tool_name" == "ExitPlanMode") ]]; then
-        log "$tool_name: '$question_text' ($option_count options)"
-
-        # Build AppleScript list from actual options
-        as_list=""
-        IFS='|' read -ra labels <<< "$option_labels"
-        for i in "${!labels[@]}"; do
-            [[ -n "$as_list" ]] && as_list+=", "
-            as_list+="\"$((i+1)). $(as_escape "${labels[$i]}")\""
-        done
-        as_list+=", \"$((${#labels[@]}+1)). Type something\""
-
-        sq=$(as_escape "${question_text:-Claude is asking...}")
-
-        result=$(osascript 2>/dev/null <<APPL
-tell application "System Events" to activate
-try
-    set chosen to choose from list {${as_list}} ¬
-        with title "Claude Code — $tool_name" ¬
-        with prompt "$sq" ¬
-        OK button name "Select" ¬
-        cancel button name "Skip"
-    if chosen is false then return "SKIP"
-    return item 1 of chosen
-on error
-    return "SKIP"
-end try
-APPL
-        ) || result="SKIP"
-
-        log "$tool_name result: '$result'"
-
-        # Allow the tool to proceed
-        cat <<'ENDJSON'
-{
-  "hookSpecificOutput": {
-    "hookEventName": "PreToolUse",
-    "permissionDecision": "allow"
-  }
-}
-ENDJSON
-
-        # Send selection via tmux in background
-        if [[ "$result" != "SKIP" ]]; then
-            selected_num="${result%%.*}"
-            (
-                sleep 1.0
-                if [[ "$selected_num" -le "$option_count" ]]; then
-                    for (( i=1; i<selected_num; i++ )); do
-                        send_keys Down; sleep 0.1
-                    done
-                    send_keys Enter
-                else
-                    # "Type something" — navigate past all options
-                    for (( i=1; i<=option_count; i++ )); do
-                        send_keys Down; sleep 0.1
-                    done
-                    send_keys Enter
-                fi
-                log "Sent $tool_name selection $selected_num"
-            ) &
-        fi
-        exit 0
-    fi
-
-    # ── All other tools: exit 0 silently (normal permission system) ──────────
     exit 0
 fi
 
