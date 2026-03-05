@@ -32,6 +32,7 @@ SCAN_INTERVAL="${CLAUDE_WATCHER_INTERVAL:-3}"
 SOUND_FILE="${CLAUDE_WATCHER_SOUND:-/System/Library/Sounds/Glass.aiff}"
 AUTO_FOCUS="${CLAUDE_WATCHER_AUTO_FOCUS:-true}"
 COOLDOWN="${CLAUDE_WATCHER_COOLDOWN:-30}"
+ACTIVE_FILE="$STATE_DIR/active"
 
 mkdir -p "$STATE_DIR" "$ALERTS_DIR"
 
@@ -280,12 +281,7 @@ scan_once() {
                     send_notification "Claude interrupted" "[$pane] Needs direction after interrupt" "$session_name"
                 fi
                 ;;
-            idle)
-                if should_alert "$pane" "$state"; then
-                    send_notification "Claude is idle" "[$pane] Waiting for your input" "$session_name"
-                fi
-                ;;
-            working|idle_with_input)
+            idle|working|idle_with_input)
                 clear_alert "$pane"
                 ;;
         esac
@@ -308,6 +304,9 @@ run_loop() {
 cmd_start() {
     local daemon=false
     [[ "${1:-}" == "-d" || "${1:-}" == "--daemon" ]] && daemon=true
+
+    # Mark watcher as active (hooks check this before sending notifications)
+    touch "$ACTIVE_FILE"
 
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
         echo -e "${YELLOW}Watcher already running (PID: $(cat "$PID_FILE"))${NC}"
@@ -335,9 +334,12 @@ cmd_start() {
 }
 
 cmd_stop() {
+    # Remove active flag so hooks stop sending notifications
+    rm -f "$ACTIVE_FILE"
+
     if [[ ! -f "$PID_FILE" ]]; then
-        echo -e "${YELLOW}No watcher running${NC}"
-        return 1
+        echo -e "${GREEN}Notifications disabled${NC}"
+        return 0
     fi
 
     local pid
@@ -348,7 +350,7 @@ cmd_stop() {
         echo -e "${GREEN}Watcher stopped${NC} (was PID: $pid)"
     else
         rm -f "$PID_FILE"
-        echo -e "${YELLOW}Stale PID file cleaned (process was already gone)${NC}"
+        echo -e "${GREEN}Notifications disabled${NC} (daemon was already gone)"
     fi
 }
 
@@ -396,10 +398,15 @@ cmd_status() {
     echo ""
 
     # Watcher status
-    if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        echo -e "  ${GREEN}●${NC} Watcher: ${GREEN}running${NC} (PID: $(cat "$PID_FILE"))"
+    if [[ -f "$ACTIVE_FILE" ]]; then
+        echo -e "  ${GREEN}●${NC} Notifications: ${GREEN}active${NC}"
     else
-        echo -e "  ${DIM}○ Watcher: not running${NC}"
+        echo -e "  ${DIM}○ Notifications: disabled${NC} (run 'claude-watcher start' to enable)"
+    fi
+    if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        echo -e "  ${GREEN}●${NC} Scanner daemon: ${GREEN}running${NC} (PID: $(cat "$PID_FILE"))"
+    else
+        echo -e "  ${DIM}○ Scanner daemon: not running${NC}"
     fi
 
     # Summary
@@ -462,12 +469,12 @@ cmd_install() {
 
         settings.hooks = settings.hooks || {};
 
-        // ── Notification hook (permission_prompt, idle_prompt) ──
+        // ── Notification hook (permission_prompt only) ──
         settings.hooks.Notification = (settings.hooks.Notification || []).filter(
             h => !h.hooks?.some(c => c.command?.includes('on-claude-notify'))
         );
         settings.hooks.Notification.push({
-            matcher: { notification_type: ['permission_prompt', 'idle_prompt'] },
+            matcher: 'permission_prompt',
             hooks: [{ type: 'command', command: '$hook_script' }]
         });
 
@@ -476,7 +483,7 @@ cmd_install() {
             h => !h.hooks?.some(c => c.command?.includes('on-claude-notify'))
         );
         settings.hooks.Elicitation.push({
-            matcher: {},
+            matcher: '',
             hooks: [{ type: 'command', command: '$hook_script' }]
         });
 
@@ -485,7 +492,7 @@ cmd_install() {
             h => !h.hooks?.some(c => c.command?.includes('on-claude-notify'))
         );
         settings.hooks.PermissionRequest.push({
-            matcher: {},
+            matcher: '',
             hooks: [{ type: 'command', command: '$hook_script' }]
         });
 

@@ -13,7 +13,14 @@ LOG_FILE="$STATE_DIR/watcher.log"
 AUTO_FOCUS="${CLAUDE_WATCHER_AUTO_FOCUS:-true}"
 SOUND_FILE="${CLAUDE_WATCHER_SOUND:-/System/Library/Sounds/Glass.aiff}"
 
+ACTIVE_FILE="$STATE_DIR/active"
+
 mkdir -p "$STATE_DIR" "$ALERTS_DIR"
+
+# Exit silently if watcher is not active (i.e. `claude-watcher stop` was called)
+if [[ ! -f "$ACTIVE_FILE" ]]; then
+    exit 0
+fi
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] HOOK: $*" >> "$LOG_FILE"
