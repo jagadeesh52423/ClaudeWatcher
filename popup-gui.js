@@ -102,33 +102,40 @@ function showOptions(data) {
 
     var alert = $.NSAlert.alloc.init;
     alert.messageText = $(title);
-    alert.informativeText = $(message);
     alert.alertStyle = $.NSAlertStyleInformational;
 
-    // Container: numbered list + dropdown + "or type something" text field
-    var viewWidth = 420;
-    var padding = 8;
+    var viewWidth = 460;
+    var padding = 10;
+    var innerW = viewWidth - padding * 2;
     var textFieldHeight = 28;
-    var textLabelHeight = 18;
-    var popupHeight = 30;
-    var listHeight = options.length * 22 + 8;
-    var viewHeight = listHeight + popupHeight + 12 + textLabelHeight + textFieldHeight + padding * 2;
+    var textLabelHeight = 16;
+    var popupHeight = 28;
+    var gap = 8;
+
+    // Measure question text height (wrapping)
+    var questionHeight = measureTextHeight(message, innerW, 13);
+
+    var viewHeight = questionHeight + gap + popupHeight + gap + textLabelHeight + 2 + textFieldHeight + padding * 2;
 
     var container = $.NSView.alloc.initWithFrame(
         $.NSMakeRect(0, 0, viewWidth, viewHeight)
     );
 
+    // Bottom-up layout (Cocoa is bottom-left origin)
+    var y = padding;
+
     // Text field at the very bottom
     var textField = $.NSTextField.alloc.initWithFrame(
-        $.NSMakeRect(padding, padding, viewWidth - padding * 2, textFieldHeight)
+        $.NSMakeRect(padding, y, innerW, textFieldHeight)
     );
-    textField.placeholderString = $("Type something else...");
+    textField.placeholderString = $("Or type something...");
     textField.font = $.NSFont.systemFontOfSize(13);
     container.addSubview(textField);
+    y += textFieldHeight + 2;
 
     // Label for text field
     var textLabel = $.NSTextField.alloc.initWithFrame(
-        $.NSMakeRect(padding, padding + textFieldHeight + 2, viewWidth - padding * 2, textLabelHeight)
+        $.NSMakeRect(padding, y, innerW, textLabelHeight)
     );
     textLabel.stringValue = $("Or type something:");
     textLabel.editable = false;
@@ -137,45 +144,51 @@ function showOptions(data) {
     textLabel.font = $.NSFont.systemFontOfSize(11);
     textLabel.textColor = $.NSColor.secondaryLabelColor;
     container.addSubview(textLabel);
+    y += textLabelHeight + gap;
 
-    // Dropdown popup button above the text area
-    var popupY = padding + textFieldHeight + textLabelHeight + padding;
+    // Dropdown
     var popup = $.NSPopUpButton.alloc.initWithFramePullsDown(
-        $.NSMakeRect(padding, popupY, viewWidth - padding * 2, 28), false
+        $.NSMakeRect(padding, y, innerW, popupHeight), false
     );
     popup.font = $.NSFont.systemFontOfSize(13);
     for (var j = 0; j < options.length; j++) {
         popup.addItemWithTitle($((j + 1) + ". " + options[j]));
     }
     container.addSubview(popup);
+    y += popupHeight + gap;
 
-    // Numbered list as static text (for visual reference)
-    var listText = "";
-    for (var i = 0; i < options.length; i++) {
-        listText += (i + 1) + ".  " + options[i] + "\n";
-    }
-    var label = $.NSTextField.alloc.initWithFrame(
-        $.NSMakeRect(padding, popupY + popupHeight + 4, viewWidth - padding * 2, listHeight)
+    // Question text as wrapping label (not informativeText which truncates)
+    var questionLabel = $.NSTextField.alloc.initWithFrame(
+        $.NSMakeRect(padding, y, innerW, questionHeight)
     );
-    label.stringValue = $(listText.trim());
-    label.editable = false;
-    label.bordered = false;
-    label.drawsBackground = false;
-    label.font = $.NSFont.systemFontOfSize(13);
-    label.selectable = false;
-    container.addSubview(label);
+    questionLabel.stringValue = $(message);
+    questionLabel.editable = false;
+    questionLabel.bordered = false;
+    questionLabel.drawsBackground = false;
+    questionLabel.font = $.NSFont.systemFontOfSize(13);
+    questionLabel.selectable = true;
+    questionLabel.lineBreakMode = $.NSLineBreakByWordWrapping;
+    questionLabel.usesSingleLineMode = false;
+    questionLabel.cell.wraps = true;
+    container.addSubview(questionLabel);
+
+    // Tab order: dropdown → text field → dropdown
+    popup.nextKeyView = textField;
+    textField.nextKeyView = popup;
 
     alert.accessoryView = container;
     alert.addButtonWithTitle($("Select"));
     alert.addButtonWithTitle($("Skip"));
 
-    setMinWidth(alert, 500);
+    setMinWidth(alert, viewWidth + 60);
     alert.window.center;
     alert.window.setLevel($.NSStatusWindowLevel);
 
+    // Focus the dropdown by default
+    alert.window.makeFirstResponder(popup);
+
     var response = alert.runModal;
     if (response == 1000) {
-        // Text field takes priority — if user typed something, return that
         var typedText = textField.stringValue.js;
         if (typedText && typedText.length > 0) {
             return "OTHER:" + typedText;
@@ -197,32 +210,41 @@ function showMultiSelect(data) {
 
     var alert = $.NSAlert.alloc.init;
     alert.messageText = $(title);
-    alert.informativeText = $(message);
     alert.alertStyle = $.NSAlertStyleInformational;
 
-    var viewWidth = 420;
+    var viewWidth = 460;
+    var padding = 10;
+    var innerW = viewWidth - padding * 2;
     var checkboxHeight = 24;
     var textFieldHeight = 28;
-    var textLabelHeight = 18;
-    var padding = 8;
-    // checkboxes + "Type something" label + text field
-    var viewHeight = (options.length * checkboxHeight) + padding + textLabelHeight + textFieldHeight + padding * 2;
+    var textLabelHeight = 16;
+    var gap = 8;
+
+    var questionHeight = measureTextHeight(message, innerW, 13);
+
+    var viewHeight = questionHeight + gap
+        + (options.length * checkboxHeight) + gap
+        + textLabelHeight + 2 + textFieldHeight + padding * 2;
 
     var container = $.NSView.alloc.initWithFrame(
         $.NSMakeRect(0, 0, viewWidth, viewHeight)
     );
 
-    // "Type something" text field at the bottom
+    // Bottom-up layout
+    var y = padding;
+
+    // Text field at the bottom
     var textField = $.NSTextField.alloc.initWithFrame(
-        $.NSMakeRect(padding, padding, viewWidth - padding * 2, textFieldHeight)
+        $.NSMakeRect(padding, y, innerW, textFieldHeight)
     );
-    textField.placeholderString = $("Type something else...");
+    textField.placeholderString = $("Or type something...");
     textField.font = $.NSFont.systemFontOfSize(13);
     container.addSubview(textField);
+    y += textFieldHeight + 2;
 
-    // Label for text field
+    // Label
     var textLabel = $.NSTextField.alloc.initWithFrame(
-        $.NSMakeRect(padding, padding + textFieldHeight + 2, viewWidth - padding * 2, textLabelHeight)
+        $.NSMakeRect(padding, y, innerW, textLabelHeight)
     );
     textLabel.stringValue = $("Or type something:");
     textLabel.editable = false;
@@ -231,29 +253,56 @@ function showMultiSelect(data) {
     textLabel.font = $.NSFont.systemFontOfSize(11);
     textLabel.textColor = $.NSColor.secondaryLabelColor;
     container.addSubview(textLabel);
+    y += textLabelHeight + gap;
 
-    // Checkboxes (bottom-up layout, above the text field)
+    // Checkboxes (last option at bottom, first at top)
     var checkboxes = [];
-    var baseY = padding + textFieldHeight + textLabelHeight + padding;
-    for (var i = 0; i < options.length; i++) {
+    for (var i = options.length - 1; i >= 0; i--) {
         var cb = $.NSButton.alloc.initWithFrame(
-            $.NSMakeRect(padding, baseY + (options.length - 1 - i) * checkboxHeight, viewWidth - padding * 2, checkboxHeight)
+            $.NSMakeRect(padding, y, innerW, checkboxHeight)
         );
         cb.setButtonType($.NSSwitchButton);
         cb.title = $((i + 1) + ".  " + options[i]);
         cb.font = $.NSFont.systemFontOfSize(13);
         cb.state = $.NSOffState;
         container.addSubview(cb);
-        checkboxes.push(cb);
+        checkboxes.unshift(cb); // keep index order
+        y += checkboxHeight;
     }
+    y += gap;
+
+    // Question text
+    var questionLabel = $.NSTextField.alloc.initWithFrame(
+        $.NSMakeRect(padding, y, innerW, questionHeight)
+    );
+    questionLabel.stringValue = $(message);
+    questionLabel.editable = false;
+    questionLabel.bordered = false;
+    questionLabel.drawsBackground = false;
+    questionLabel.font = $.NSFont.systemFontOfSize(13);
+    questionLabel.selectable = true;
+    questionLabel.lineBreakMode = $.NSLineBreakByWordWrapping;
+    questionLabel.usesSingleLineMode = false;
+    questionLabel.cell.wraps = true;
+    container.addSubview(questionLabel);
+
+    // Tab order: checkbox1 → checkbox2 → ... → textField → checkbox1
+    for (var t = 0; t < checkboxes.length - 1; t++) {
+        checkboxes[t].nextKeyView = checkboxes[t + 1];
+    }
+    checkboxes[checkboxes.length - 1].nextKeyView = textField;
+    textField.nextKeyView = checkboxes[0];
 
     alert.accessoryView = container;
     alert.addButtonWithTitle($("Select"));
     alert.addButtonWithTitle($("Skip"));
 
-    setMinWidth(alert, 500);
+    setMinWidth(alert, viewWidth + 60);
     alert.window.center;
     alert.window.setLevel($.NSStatusWindowLevel);
+
+    // Focus first checkbox
+    alert.window.makeFirstResponder(checkboxes[0]);
 
     var response = alert.runModal;
     if (response == 1000) {
@@ -264,12 +313,9 @@ function showMultiSelect(data) {
             }
         }
         var typedText = textField.stringValue.js;
-
-        // If user typed something, add it
         if (typedText && typedText.length > 0) {
             selected.push("OTHER:" + typedText);
         }
-
         if (selected.length === 0) return "SKIP";
         return selected.join("|");
     }
@@ -314,6 +360,21 @@ function showText(data) {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function measureTextHeight(text, width, fontSize) {
+    // Use a temporary NSTextField to measure wrapped text height
+    var tf = $.NSTextField.alloc.initWithFrame($.NSMakeRect(0, 0, width, 10));
+    tf.stringValue = $(text);
+    tf.font = $.NSFont.systemFontOfSize(fontSize);
+    tf.editable = false;
+    tf.bordered = false;
+    tf.lineBreakMode = $.NSLineBreakByWordWrapping;
+    tf.usesSingleLineMode = false;
+    tf.cell.wraps = true;
+    tf.preferredMaxLayoutWidth = width;
+    var size = tf.cell.cellSizeForBounds($.NSMakeRect(0, 0, width, 10000));
+    return Math.ceil(size.height) + 4;
+}
 
 function setMinWidth(alert, width) {
     var win = alert.window;
