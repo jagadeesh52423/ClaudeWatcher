@@ -13,11 +13,69 @@
 ObjC.import("Cocoa");
 ObjC.import("stdlib");
 
+// ─── ObjC subclasses ─────────────────────────────────────────────────────────
+
+ObjC.registerSubclass({
+    name: "PanelButtonHandler",
+    methods: {
+        "buttonClicked:": {
+            types: ["void", ["id"]],
+            implementation: function (sender) {
+                $.NSApp.stopModalWithCode(sender.tag);
+            }
+        }
+    }
+});
+
+var _buttonHandler = $.PanelButtonHandler.alloc.init;
+
+// Custom NSPanel that intercepts Tab/Shift-Tab to cycle ALL controls
+// (macOS normally skips non-text controls unless system keyboard nav is on)
+// Key insight: when a text field is focused, the actual firstResponder is an
+// NSTextView (field editor), not the NSTextField itself. We must resolve it
+// back to the delegate control before following the nextKeyView chain.
+ObjC.registerSubclass({
+    name: "TabPanel",
+    superclass: "NSPanel",
+    methods: {
+        "sendEvent:": {
+            types: ["void", ["id"]],
+            implementation: function (event) {
+                // NSEventTypeKeyDown = 10, Tab keyCode = 48
+                if (event.type == 10 && event.keyCode == 48) {
+                    var fr = this.firstResponder;
+                    var control = fr;
+
+                    // Resolve field editor back to actual control
+                    if (fr.isKindOfClass($.NSTextView)) {
+                        var delegate = fr.delegate;
+                        if (delegate && delegate.isKindOfClass($.NSControl)) {
+                            control = delegate;
+                        }
+                    }
+
+                    var shift = (event.modifierFlags & $.NSEventModifierFlagShift) != 0;
+                    var next = shift ? control.previousKeyView : control.nextKeyView;
+                    if (next) {
+                        this.makeFirstResponder(next);
+                    }
+                    return; // consume Tab
+                }
+                ObjC.super(this).sendEvent(event);
+            }
+        }
+    }
+});
+
+// Result codes
+var RC_OK = 1;
+var RC_SKIP = 2;
+
+// ─── Entry point ─────────────────────────────────────────────────────────────
+
 function run(argv) {
     var paramsFile = argv[0];
-    if (!paramsFile) {
-        return "ERROR:no-params-file";
-    }
+    if (!paramsFile) return "ERROR:no-params-file";
 
     var data;
     try {
@@ -29,26 +87,20 @@ function run(argv) {
         return "ERROR:parse-failed";
     }
 
-    // Activate as accessory app (no dock icon)
     var app = $.NSApplication.sharedApplication;
     app.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
     app.activateIgnoringOtherApps(true);
 
     var type = data.type || "permission";
 
-    if (type === "permission") {
-        return showPermission(data);
-    } else if (type === "options") {
-        return showOptions(data);
-    } else if (type === "text") {
-        return showText(data);
-    }
+    if (type === "permission") return showPermission(data);
+    if (type === "options")    return showOptions(data);
+    if (type === "text")       return showText(data);
 
     return "ERROR:unknown-type";
 }
 
-// ─── Permission Dialog ───────────────────────────────────────────────────────
-// Large NSAlert with tool name, formatted summary, 3 action buttons
+// ─── Permission Dialog (NSAlert — simple, no tab issues) ─────────────────────
 
 function showPermission(data) {
     var tool = data.tool || "Unknown Tool";
@@ -58,7 +110,6 @@ function showPermission(data) {
     var title = "Claude Code" + (project ? " — " + project : "");
     var body = "🔧  " + tool;
     if (summary) {
-        // Truncate long summaries
         if (summary.length > 500) summary = summary.substring(0, 497) + "...";
         body += "\n\n" + summary;
     }
@@ -68,27 +119,21 @@ function showPermission(data) {
     alert.informativeText = $(body);
     alert.alertStyle = $.NSAlertStyleWarning;
 
-    // Buttons — rightmost is default
     alert.addButtonWithTitle($("Allow Once"));
     alert.addButtonWithTitle($("Always Allow"));
     alert.addButtonWithTitle($("Deny"));
 
-    // Make the informative text use a slightly larger font
-    var views = alert.window.contentView.subviews;
     setMinWidth(alert, 480);
-
     alert.window.center;
     alert.window.setLevel($.NSStatusWindowLevel);
 
     var response = alert.runModal;
-    // NSAlertFirstButtonReturn = 1000 (returned as string in JXA)
     if (response == 1000) return "Allow Once";
     if (response == 1001) return "Always Allow";
     return "Deny";
 }
 
-// ─── Options Dialog ──────────────────────────────────────────────────────────
-// NSAlert with NSPopUpButton dropdown for single selection
+// ─── Options Dialog (NSPanel — full Tab support) ─────────────────────────────
 
 function showOptions(data) {
     var title = data.title || "Claude Code";
@@ -96,233 +141,172 @@ function showOptions(data) {
     var options = data.options || [];
     if (options.length === 0) return "SKIP";
 
-    if (data.multiSelect) {
-        return showMultiSelect(data);
-    }
+    if (data.multiSelect) return showMultiSelect(data);
 
-    var alert = $.NSAlert.alloc.init;
-    alert.messageText = $(title);
-    alert.alertStyle = $.NSAlertStyleInformational;
+    var W = 500, pad = 16, innerW = W - pad * 2;
+    var btnH = 32, tfH = 28, lblH = 16, popH = 28, gap = 10;
 
-    var viewWidth = 460;
-    var padding = 10;
-    var innerW = viewWidth - padding * 2;
-    var textFieldHeight = 28;
-    var textLabelHeight = 16;
-    var popupHeight = 28;
-    var gap = 8;
+    var qH = measureTextHeight(message, innerW, 13);
 
-    // Measure question text height (wrapping)
-    var questionHeight = measureTextHeight(message, innerW, 13);
+    var totalH = pad + qH + gap + popH + gap + lblH + 4 + tfH + gap + btnH + pad;
 
-    var viewHeight = questionHeight + gap + popupHeight + gap + textLabelHeight + 2 + textFieldHeight + padding * 2;
+    var panel = makePanel(title, W, totalH);
+    var cv = panel.contentView;
+    var y = pad;
 
-    var container = $.NSView.alloc.initWithFrame(
-        $.NSMakeRect(0, 0, viewWidth, viewHeight)
-    );
+    // --- Buttons at bottom ---
+    var skipBtn = makeButton("Skip", pad, y, 90, btnH, RC_SKIP);
+    var selBtn  = makeButton("Select", W - pad - 100, y, 100, btnH, RC_OK);
+    selBtn.keyEquivalent = $("\r"); // Enter = Select
+    cv.addSubview(skipBtn);
+    cv.addSubview(selBtn);
+    y += btnH + gap;
 
-    // Bottom-up layout (Cocoa is bottom-left origin)
-    var y = padding;
-
-    // Text field at the very bottom
+    // --- Text field ---
     var textField = $.NSTextField.alloc.initWithFrame(
-        $.NSMakeRect(padding, y, innerW, textFieldHeight)
+        $.NSMakeRect(pad, y, innerW, tfH)
     );
     textField.placeholderString = $("Or type something...");
     textField.font = $.NSFont.systemFontOfSize(13);
-    container.addSubview(textField);
-    y += textFieldHeight + 2;
+    cv.addSubview(textField);
+    y += tfH + 4;
 
-    // Label for text field
-    var textLabel = $.NSTextField.alloc.initWithFrame(
-        $.NSMakeRect(padding, y, innerW, textLabelHeight)
-    );
-    textLabel.stringValue = $("Or type something:");
-    textLabel.editable = false;
-    textLabel.bordered = false;
-    textLabel.drawsBackground = false;
-    textLabel.font = $.NSFont.systemFontOfSize(11);
-    textLabel.textColor = $.NSColor.secondaryLabelColor;
-    container.addSubview(textLabel);
-    y += textLabelHeight + gap;
+    // --- "Or type something:" label ---
+    var lbl = makeLabel("Or type something:", pad, y, innerW, lblH, 11);
+    lbl.textColor = $.NSColor.secondaryLabelColor;
+    cv.addSubview(lbl);
+    y += lblH + gap;
 
-    // Dropdown
+    // --- Dropdown ---
     var popup = $.NSPopUpButton.alloc.initWithFramePullsDown(
-        $.NSMakeRect(padding, y, innerW, popupHeight), false
+        $.NSMakeRect(pad, y, innerW, popH), false
     );
     popup.font = $.NSFont.systemFontOfSize(13);
     for (var j = 0; j < options.length; j++) {
         popup.addItemWithTitle($((j + 1) + ". " + options[j]));
     }
-    container.addSubview(popup);
-    y += popupHeight + gap;
+    cv.addSubview(popup);
+    y += popH + gap;
 
-    // Question text as wrapping label (not informativeText which truncates)
-    var questionLabel = $.NSTextField.alloc.initWithFrame(
-        $.NSMakeRect(padding, y, innerW, questionHeight)
-    );
-    questionLabel.stringValue = $(message);
-    questionLabel.editable = false;
-    questionLabel.bordered = false;
-    questionLabel.drawsBackground = false;
-    questionLabel.font = $.NSFont.systemFontOfSize(13);
-    questionLabel.selectable = true;
-    questionLabel.lineBreakMode = $.NSLineBreakByWordWrapping;
-    questionLabel.usesSingleLineMode = false;
-    questionLabel.cell.wraps = true;
-    container.addSubview(questionLabel);
+    // --- Question label ---
+    var qLabel = makeLabel(message, pad, y, innerW, qH, 13);
+    qLabel.selectable = true;
+    cv.addSubview(qLabel);
 
-    // Tab order: dropdown → text field → dropdown
+    // --- Tab order: popup → textField → Select → Skip → popup ---
     popup.nextKeyView = textField;
-    textField.nextKeyView = popup;
+    textField.nextKeyView = selBtn;
+    selBtn.nextKeyView = skipBtn;
+    skipBtn.nextKeyView = popup;
+    // Reverse for Shift-Tab
+    popup.previousKeyView = skipBtn;
+    skipBtn.previousKeyView = selBtn;
+    selBtn.previousKeyView = textField;
+    textField.previousKeyView = popup;
+    panel.initialFirstResponder = popup;
 
-    alert.accessoryView = container;
-    alert.addButtonWithTitle($("Select"));
-    alert.addButtonWithTitle($("Skip"));
-
-    setMinWidth(alert, viewWidth + 60);
-    alert.window.center;
-    alert.window.setLevel($.NSStatusWindowLevel);
-
-    // Focus the dropdown by default
-    alert.window.makeFirstResponder(popup);
-
-    var response = alert.runModal;
-    if (response == 1000) {
-        var typedText = textField.stringValue.js;
-        if (typedText && typedText.length > 0) {
-            return "OTHER:" + typedText;
-        }
-        var selectedIdx = popup.indexOfSelectedItem;
-        var idx = parseInt("" + selectedIdx, 10);
+    var rc = runPanel(panel);
+    if (rc == RC_OK) {
+        var typed = textField.stringValue.js;
+        if (typed && typed.length > 0) return "OTHER:" + typed;
+        var idx = parseInt("" + popup.indexOfSelectedItem, 10);
         return (idx + 1) + ". " + options[idx];
     }
     return "SKIP";
 }
 
-// ─── Multi-Select Dialog ────────────────────────────────────────────────────
-// NSAlert with checkboxes for multiple selection + "Type something" text field
+// ─── Multi-Select Dialog (NSPanel) ───────────────────────────────────────────
 
 function showMultiSelect(data) {
     var title = data.title || "Claude Code";
     var message = data.message || "Select one or more options:";
     var options = data.options || [];
 
-    var alert = $.NSAlert.alloc.init;
-    alert.messageText = $(title);
-    alert.alertStyle = $.NSAlertStyleInformational;
+    var W = 500, pad = 16, innerW = W - pad * 2;
+    var btnH = 32, tfH = 28, lblH = 16, cbH = 24, gap = 10;
 
-    var viewWidth = 460;
-    var padding = 10;
-    var innerW = viewWidth - padding * 2;
-    var checkboxHeight = 24;
-    var textFieldHeight = 28;
-    var textLabelHeight = 16;
-    var gap = 8;
+    var qH = measureTextHeight(message, innerW, 13);
 
-    var questionHeight = measureTextHeight(message, innerW, 13);
+    var totalH = pad + qH + gap + (options.length * cbH) + gap + lblH + 4 + tfH + gap + btnH + pad;
 
-    var viewHeight = questionHeight + gap
-        + (options.length * checkboxHeight) + gap
-        + textLabelHeight + 2 + textFieldHeight + padding * 2;
+    var panel = makePanel(title, W, totalH);
+    var cv = panel.contentView;
+    var y = pad;
 
-    var container = $.NSView.alloc.initWithFrame(
-        $.NSMakeRect(0, 0, viewWidth, viewHeight)
-    );
+    // --- Buttons at bottom ---
+    var skipBtn = makeButton("Skip", pad, y, 90, btnH, RC_SKIP);
+    var selBtn  = makeButton("Select", W - pad - 100, y, 100, btnH, RC_OK);
+    selBtn.keyEquivalent = $("\r");
+    cv.addSubview(skipBtn);
+    cv.addSubview(selBtn);
+    y += btnH + gap;
 
-    // Bottom-up layout
-    var y = padding;
-
-    // Text field at the bottom
+    // --- Text field ---
     var textField = $.NSTextField.alloc.initWithFrame(
-        $.NSMakeRect(padding, y, innerW, textFieldHeight)
+        $.NSMakeRect(pad, y, innerW, tfH)
     );
     textField.placeholderString = $("Or type something...");
     textField.font = $.NSFont.systemFontOfSize(13);
-    container.addSubview(textField);
-    y += textFieldHeight + 2;
+    cv.addSubview(textField);
+    y += tfH + 4;
 
-    // Label
-    var textLabel = $.NSTextField.alloc.initWithFrame(
-        $.NSMakeRect(padding, y, innerW, textLabelHeight)
-    );
-    textLabel.stringValue = $("Or type something:");
-    textLabel.editable = false;
-    textLabel.bordered = false;
-    textLabel.drawsBackground = false;
-    textLabel.font = $.NSFont.systemFontOfSize(11);
-    textLabel.textColor = $.NSColor.secondaryLabelColor;
-    container.addSubview(textLabel);
-    y += textLabelHeight + gap;
+    // --- Label ---
+    var lbl = makeLabel("Or type something:", pad, y, innerW, lblH, 11);
+    lbl.textColor = $.NSColor.secondaryLabelColor;
+    cv.addSubview(lbl);
+    y += lblH + gap;
 
-    // Checkboxes (last option at bottom, first at top)
+    // --- Checkboxes (last at bottom, first at top) ---
     var checkboxes = [];
     for (var i = options.length - 1; i >= 0; i--) {
         var cb = $.NSButton.alloc.initWithFrame(
-            $.NSMakeRect(padding, y, innerW, checkboxHeight)
+            $.NSMakeRect(pad, y, innerW, cbH)
         );
         cb.setButtonType($.NSSwitchButton);
         cb.title = $((i + 1) + ".  " + options[i]);
         cb.font = $.NSFont.systemFontOfSize(13);
         cb.state = $.NSOffState;
-        container.addSubview(cb);
-        checkboxes.unshift(cb); // keep index order
-        y += checkboxHeight;
+        cv.addSubview(cb);
+        checkboxes.unshift(cb);
+        y += cbH;
     }
     y += gap;
 
-    // Question text
-    var questionLabel = $.NSTextField.alloc.initWithFrame(
-        $.NSMakeRect(padding, y, innerW, questionHeight)
-    );
-    questionLabel.stringValue = $(message);
-    questionLabel.editable = false;
-    questionLabel.bordered = false;
-    questionLabel.drawsBackground = false;
-    questionLabel.font = $.NSFont.systemFontOfSize(13);
-    questionLabel.selectable = true;
-    questionLabel.lineBreakMode = $.NSLineBreakByWordWrapping;
-    questionLabel.usesSingleLineMode = false;
-    questionLabel.cell.wraps = true;
-    container.addSubview(questionLabel);
+    // --- Question label ---
+    var qLabel = makeLabel(message, pad, y, innerW, qH, 13);
+    qLabel.selectable = true;
+    cv.addSubview(qLabel);
 
-    // Tab order: checkbox1 → checkbox2 → ... → textField → checkbox1
+    // --- Tab order: cb1 → cb2 → ... → textField → Select → Skip → cb1 ---
     for (var t = 0; t < checkboxes.length - 1; t++) {
         checkboxes[t].nextKeyView = checkboxes[t + 1];
+        checkboxes[t + 1].previousKeyView = checkboxes[t];
     }
     checkboxes[checkboxes.length - 1].nextKeyView = textField;
-    textField.nextKeyView = checkboxes[0];
+    textField.previousKeyView = checkboxes[checkboxes.length - 1];
+    textField.nextKeyView = selBtn;
+    selBtn.previousKeyView = textField;
+    selBtn.nextKeyView = skipBtn;
+    skipBtn.previousKeyView = selBtn;
+    skipBtn.nextKeyView = checkboxes[0];
+    checkboxes[0].previousKeyView = skipBtn;
+    panel.initialFirstResponder = checkboxes[0];
 
-    alert.accessoryView = container;
-    alert.addButtonWithTitle($("Select"));
-    alert.addButtonWithTitle($("Skip"));
-
-    setMinWidth(alert, viewWidth + 60);
-    alert.window.center;
-    alert.window.setLevel($.NSStatusWindowLevel);
-
-    // Focus first checkbox
-    alert.window.makeFirstResponder(checkboxes[0]);
-
-    var response = alert.runModal;
-    if (response == 1000) {
+    var rc = runPanel(panel);
+    if (rc == RC_OK) {
         var selected = [];
         for (var k = 0; k < checkboxes.length; k++) {
-            if (checkboxes[k].state == $.NSOnState) {
-                selected.push(k + 1);
-            }
+            if (checkboxes[k].state == $.NSOnState) selected.push(k + 1);
         }
-        var typedText = textField.stringValue.js;
-        if (typedText && typedText.length > 0) {
-            selected.push("OTHER:" + typedText);
-        }
+        var typed = textField.stringValue.js;
+        if (typed && typed.length > 0) selected.push("OTHER:" + typed);
         if (selected.length === 0) return "SKIP";
         return selected.join("|");
     }
     return "SKIP";
 }
 
-// ─── Text Input Dialog ───────────────────────────────────────────────────────
+// ─── Text Input Dialog (NSAlert — just a text field, Tab not needed) ─────────
 
 function showText(data) {
     var title = data.title || "Claude Code — Question";
@@ -333,7 +317,6 @@ function showText(data) {
     alert.informativeText = $(message);
     alert.alertStyle = $.NSAlertStyleInformational;
 
-    // Text field accessory
     var textField = $.NSTextField.alloc.initWithFrame(
         $.NSMakeRect(0, 0, 380, 80)
     );
@@ -347,8 +330,6 @@ function showText(data) {
     setMinWidth(alert, 460);
     alert.window.center;
     alert.window.setLevel($.NSStatusWindowLevel);
-
-    // Focus the text field
     alert.window.makeFirstResponder(textField);
 
     var response = alert.runModal;
@@ -361,8 +342,53 @@ function showText(data) {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+function makePanel(title, width, height) {
+    var panel = $.TabPanel.alloc.initWithContentRectStyleMaskBackingDefer(
+        $.NSMakeRect(0, 0, width, height),
+        $.NSTitledWindowMask | $.NSClosableWindowMask,
+        $.NSBackingStoreBuffered,
+        false
+    );
+    panel.title = $(title);
+    panel.setLevel($.NSStatusWindowLevel);
+    panel.center;
+    panel.autorecalculatesKeyViewLoop = false;
+    return panel;
+}
+
+function makeButton(label, x, y, w, h, tag) {
+    var btn = $.NSButton.alloc.initWithFrame($.NSMakeRect(x, y, w, h));
+    btn.title = $(label);
+    btn.bezelStyle = $.NSBezelStyleRounded;
+    btn.font = $.NSFont.systemFontOfSize(13);
+    btn.tag = tag;
+    btn.target = _buttonHandler;
+    btn.action = "buttonClicked:";
+    return btn;
+}
+
+function makeLabel(text, x, y, w, h, fontSize) {
+    var lbl = $.NSTextField.alloc.initWithFrame($.NSMakeRect(x, y, w, h));
+    lbl.stringValue = $(text);
+    lbl.editable = false;
+    lbl.bordered = false;
+    lbl.drawsBackground = false;
+    lbl.font = $.NSFont.systemFontOfSize(fontSize);
+    lbl.lineBreakMode = $.NSLineBreakByWordWrapping;
+    lbl.usesSingleLineMode = false;
+    lbl.cell.wraps = true;
+    return lbl;
+}
+
+function runPanel(panel) {
+    panel.makeKeyAndOrderFront(null);
+    $.NSApp.activateIgnoringOtherApps(true);
+    var rc = $.NSApp.runModalForWindow(panel);
+    panel.orderOut(null);
+    return rc;
+}
+
 function measureTextHeight(text, width, fontSize) {
-    // Use a temporary NSTextField to measure wrapped text height
     var tf = $.NSTextField.alloc.initWithFrame($.NSMakeRect(0, 0, width, 10));
     tf.stringValue = $(text);
     tf.font = $.NSFont.systemFontOfSize(fontSize);
