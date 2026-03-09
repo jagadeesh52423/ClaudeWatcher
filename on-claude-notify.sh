@@ -69,12 +69,13 @@ try {
 } catch(e) {}
 
 // Generic options extraction — try multiple payload locations
-let qText = "", optLabels = [];
+let qText = "", optLabels = [], isMultiSelect = false;
 
 // 1. AskUserQuestion: tool_input.questions[0].options
 if ((p.tool_name || "") === "AskUserQuestion" && ti.questions && ti.questions[0]) {
     const q = ti.questions[0];
     qText = q.question || q.header || "";
+    isMultiSelect = !!q.multiSelect;
     (q.options || []).forEach((o) => {
         optLabels.push(o.label || o.value || String(o));
     });
@@ -85,6 +86,7 @@ if (optLabels.length === 0 && (p.hook_event_name || "") === "Elicitation") {
     if (p.questions && p.questions[0]) {
         const q = p.questions[0];
         qText = q.question || q.header || q.prompt || p.message || "";
+        isMultiSelect = isMultiSelect || !!q.multiSelect;
         (q.options || []).forEach((o) => {
             optLabels.push(o.label || o.value || String(o));
         });
@@ -121,6 +123,7 @@ console.log("prompt=" + sq(p.prompt || ""));
 console.log("question_text=" + sq(qText));
 console.log("option_labels=" + sq(optLabels.join("|")));
 console.log("option_count=" + optLabels.length);
+console.log("multi_select=" + (isMultiSelect ? "true" : "false"));
 console.log("perm_suggestions=" + sq(psJson));
 
 // Pre-build GUI params JSON files (proper JSON.stringify — no shell escaping needed)
@@ -134,7 +137,8 @@ if (optLabels.length > 0) {
         type: "options",
         title: "Claude Code" + (toolName ? " — " + toolName : ""),
         message: qText || "Choose an option:",
-        options: optLabels
+        options: optLabels,
+        multiSelect: isMultiSelect
     });
     fs.writeFileSync(logDir + "/gui-options.json", optGui);
     console.log("gui_options_file=" + sq(logDir + "/gui-options.json"));
@@ -205,27 +209,36 @@ if [[ "$hook_event" == "PermissionRequest" ]]; then
 
     # ── Tool with dynamic options (e.g. AskUserQuestion) ─────────────────
     if [[ "$option_count" -gt 0 && -n "$gui_options_file" ]]; then
-        log "PermissionRequest with options: $tool_name '$question_text' ($option_count options)"
+        log "PermissionRequest with options: $tool_name '$question_text' ($option_count options, multiSelect=$multi_select)"
 
         result=$(osascript -l JavaScript "$GUI_SCRIPT" "$gui_options_file" 2>/dev/null) || result="SKIP"
 
         log "PermissionRequest options result: '$result'"
 
         if [[ "$result" != "SKIP" && "$result" != "ERROR:"* ]]; then
-            selected_num="${result%%.*}"
-            IFS='|' read -ra sel_labels <<< "$option_labels"
-            if [[ "$selected_num" -le "$option_count" ]]; then
-                selected_label="${sel_labels[$((selected_num-1))]}"
-            else
-                selected_label="Other"
-            fi
-            log "Selected: '$selected_label' for '$question_text'"
 
-            # Return answer via updatedInput.answers
-            _ans_tmp=$(mktemp)
-            cat > "$_ans_tmp" << 'ANSSCRIPT'
+            # ── Multi-select result: pipe-separated indices like "1|3|OTHER:text"
+            if [[ "$multi_select" == "true" ]]; then
+                log "Multi-select result: '$result'"
+                _ans_tmp=$(mktemp)
+                cat > "$_ans_tmp" << 'MSSCRIPT'
 const qText = process.argv[2];
-const answer = process.argv[3];
+const rawResult = process.argv[3];
+const labelsStr = process.argv[4];
+const labels = labelsStr.split("|");
+const parts = rawResult.split("|");
+const selected = [];
+let typedText = "";
+parts.forEach(p => {
+    if (p.startsWith("OTHER:")) {
+        typedText = p.slice(6);
+    } else {
+        const idx = parseInt(p, 10) - 1;
+        if (idx >= 0 && idx < labels.length) selected.push(labels[idx]);
+    }
+});
+if (typedText) selected.push(typedText);
+const answer = selected.join(", ");
 const r = {
     hookSpecificOutput: {
         hookEventName: "PermissionRequest",
@@ -237,9 +250,60 @@ const r = {
 };
 r.hookSpecificOutput.decision.updatedInput.answers[qText] = answer;
 console.log(JSON.stringify(r));
+MSSCRIPT
+                node "$_ans_tmp" "$question_text" "$result" "$option_labels" 2>/dev/null
+                rm -f "$_ans_tmp"
+
+            # ── Single-select result: "N. label"
+            else
+                selected_num="${result%%.*}"
+                IFS='|' read -ra sel_labels <<< "$option_labels"
+                if [[ "$selected_num" -le "$option_count" ]]; then
+                    selected_label="${sel_labels[$((selected_num-1))]}"
+                else
+                    # "Type something" selected — show text input dialog
+                    log "Type something selected, showing text input"
+                    text_result=$(osascript -l JavaScript "$GUI_SCRIPT" "$gui_text_file" 2>/dev/null) || text_result="__SKIP__"
+                    log "Text input result: '${text_result:0:80}'"
+                    if [[ "$text_result" == "__SKIP__" || -z "$text_result" ]]; then
+                        cat <<'ENDJSON'
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PermissionRequest",
+    "decision": { "behavior": "allow" }
+  }
+}
+ENDJSON
+                        exit 0
+                    fi
+                    selected_label="Other"
+                fi
+                log "Selected: '$selected_label' for '$question_text'"
+
+                _ans_tmp=$(mktemp)
+                cat > "$_ans_tmp" << 'ANSSCRIPT'
+const qText = process.argv[2];
+const answer = process.argv[3];
+const typedText = process.argv[4] || "";
+const r = {
+    hookSpecificOutput: {
+        hookEventName: "PermissionRequest",
+        decision: {
+            behavior: "allow",
+            updatedInput: { answers: {} }
+        }
+    }
+};
+if (typedText) {
+    r.hookSpecificOutput.decision.updatedInput.answers[qText] = typedText;
+} else {
+    r.hookSpecificOutput.decision.updatedInput.answers[qText] = answer;
+}
+console.log(JSON.stringify(r));
 ANSSCRIPT
-            node "$_ans_tmp" "$question_text" "$selected_label" 2>/dev/null
-            rm -f "$_ans_tmp"
+                node "$_ans_tmp" "$question_text" "$selected_label" "${text_result:-}" 2>/dev/null
+                rm -f "$_ans_tmp"
+            fi
         else
             cat <<'ENDJSON'
 {
@@ -326,29 +390,83 @@ fi
 
 if [[ "$hook_event" == "Elicitation" ]]; then
     if [[ "$option_count" -gt 0 && -n "$gui_options_file" ]]; then
-        log "Elicitation with options: '$question_text' ($option_count options)"
+        log "Elicitation with options: '$question_text' ($option_count options, multiSelect=$multi_select)"
 
         result=$(osascript -l JavaScript "$GUI_SCRIPT" "$gui_options_file" 2>/dev/null) || result="SKIP"
 
         log "Elicitation result: '$result'"
 
         if [[ "$result" != "SKIP" && "$result" != "ERROR:"* ]]; then
-            selected_num="${result%%.*}"
-            (
-                sleep 0.5
-                if [[ "$selected_num" -le "$option_count" ]]; then
-                    for (( i=1; i<selected_num; i++ )); do
-                        send_keys Down; sleep 0.1
-                    done
-                    send_keys Enter
-                else
+
+            if [[ "$multi_select" == "true" ]]; then
+                # Multi-select: result is "1|3|OTHER:text" — need to toggle each with Space
+                IFS='|' read -ra ms_parts <<< "$result"
+                # Build space-separated list of selected indices
+                ms_indices=""
+                ms_typed=""
+                for part in "${ms_parts[@]}"; do
+                    if [[ "$part" == OTHER:* ]]; then
+                        ms_typed="${part#OTHER:}"
+                    else
+                        ms_indices="$ms_indices $part"
+                    fi
+                done
+                (
+                    sleep 0.5
+                    # Walk through all options, toggling selected ones with Space
                     for (( i=1; i<=option_count; i++ )); do
-                        send_keys Down; sleep 0.1
+                        should_select=false
+                        for idx in $ms_indices; do
+                            [[ "$idx" == "$i" ]] && should_select=true
+                        done
+                        if [[ "$should_select" == "true" ]]; then
+                            send_keys Space; sleep 0.1
+                        fi
+                        if [[ "$i" -lt "$option_count" ]]; then
+                            send_keys Down; sleep 0.1
+                        fi
                     done
+
+                    # If user typed something, navigate to "Other" and select it
+                    if [[ -n "$ms_typed" ]]; then
+                        send_keys Down; sleep 0.1
+                        send_keys Space; sleep 0.1
+                    fi
+
                     send_keys Enter
-                fi
-                log "Sent Elicitation selection $selected_num"
-            ) &
+                    log "Sent Elicitation multi-select: indices=$ms_indices typed=$ms_typed"
+                ) &
+
+            else
+                # Single-select
+                selected_num="${result%%.*}"
+                (
+                    sleep 0.5
+                    if [[ "$selected_num" -le "$option_count" ]]; then
+                        for (( i=1; i<selected_num; i++ )); do
+                            send_keys Down; sleep 0.1
+                        done
+                        send_keys Enter
+                    else
+                        # "Type something" — navigate to Other, select, then type
+                        for (( i=1; i<=option_count; i++ )); do
+                            send_keys Down; sleep 0.1
+                        done
+                        send_keys Enter
+                        sleep 0.3
+                        # Show text input for the typed response
+                        text_result=$(osascript -l JavaScript "$GUI_SCRIPT" "$gui_text_file" 2>/dev/null) || text_result="__SKIP__"
+                        if [[ "$text_result" != "__SKIP__" && -n "$text_result" ]]; then
+                            sleep 0.3
+                            if [[ "$HAS_TMUX" == "true" && "$pane" != "unknown" && "$pane" != "no-tmux" ]]; then
+                                tmux send-keys -t "$pane" -l "$text_result" 2>/dev/null || true
+                                tmux send-keys -t "$pane" Enter 2>/dev/null || true
+                            fi
+                        fi
+                    fi
+                    log "Sent Elicitation selection $selected_num"
+                ) &
+            fi
         fi
     else
         log "Elicitation free-text: '$question_text'"

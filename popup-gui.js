@@ -96,6 +96,10 @@ function showOptions(data) {
     var options = data.options || [];
     if (options.length === 0) return "SKIP";
 
+    if (data.multiSelect) {
+        return showMultiSelect(data);
+    }
+
     // Add "Type something" option
     var allOptions = options.concat(["Type something"]);
 
@@ -154,6 +158,95 @@ function showOptions(data) {
         // indexOfSelectedItem could be ObjC wrapped
         var idx = parseInt("" + selectedIdx, 10);
         return (idx + 1) + ". " + allOptions[idx];
+    }
+    return "SKIP";
+}
+
+// ─── Multi-Select Dialog ────────────────────────────────────────────────────
+// NSAlert with checkboxes for multiple selection + "Type something" text field
+
+function showMultiSelect(data) {
+    var title = data.title || "Claude Code";
+    var message = data.message || "Select one or more options:";
+    var options = data.options || [];
+
+    var alert = $.NSAlert.alloc.init;
+    alert.messageText = $(title);
+    alert.informativeText = $(message);
+    alert.alertStyle = $.NSAlertStyleInformational;
+
+    var viewWidth = 420;
+    var checkboxHeight = 24;
+    var textFieldHeight = 28;
+    var textLabelHeight = 18;
+    var padding = 8;
+    // checkboxes + "Type something" label + text field
+    var viewHeight = (options.length * checkboxHeight) + padding + textLabelHeight + textFieldHeight + padding * 2;
+
+    var container = $.NSView.alloc.initWithFrame(
+        $.NSMakeRect(0, 0, viewWidth, viewHeight)
+    );
+
+    // "Type something" text field at the bottom
+    var textField = $.NSTextField.alloc.initWithFrame(
+        $.NSMakeRect(padding, padding, viewWidth - padding * 2, textFieldHeight)
+    );
+    textField.placeholderString = $("Type something else...");
+    textField.font = $.NSFont.systemFontOfSize(13);
+    container.addSubview(textField);
+
+    // Label for text field
+    var textLabel = $.NSTextField.alloc.initWithFrame(
+        $.NSMakeRect(padding, padding + textFieldHeight + 2, viewWidth - padding * 2, textLabelHeight)
+    );
+    textLabel.stringValue = $("Or type something:");
+    textLabel.editable = false;
+    textLabel.bordered = false;
+    textLabel.drawsBackground = false;
+    textLabel.font = $.NSFont.systemFontOfSize(11);
+    textLabel.textColor = $.NSColor.secondaryLabelColor;
+    container.addSubview(textLabel);
+
+    // Checkboxes (bottom-up layout, above the text field)
+    var checkboxes = [];
+    var baseY = padding + textFieldHeight + textLabelHeight + padding;
+    for (var i = 0; i < options.length; i++) {
+        var cb = $.NSButton.alloc.initWithFrame(
+            $.NSMakeRect(padding, baseY + (options.length - 1 - i) * checkboxHeight, viewWidth - padding * 2, checkboxHeight)
+        );
+        cb.setButtonType($.NSSwitchButton);
+        cb.title = $((i + 1) + ".  " + options[i]);
+        cb.font = $.NSFont.systemFontOfSize(13);
+        cb.state = $.NSOffState;
+        container.addSubview(cb);
+        checkboxes.push(cb);
+    }
+
+    alert.accessoryView = container;
+    alert.addButtonWithTitle($("Select"));
+    alert.addButtonWithTitle($("Skip"));
+
+    setMinWidth(alert, 500);
+    alert.window.center;
+    alert.window.setLevel($.NSStatusWindowLevel);
+
+    var response = alert.runModal;
+    if (response == 1000) {
+        var selected = [];
+        for (var k = 0; k < checkboxes.length; k++) {
+            if (checkboxes[k].state == $.NSOnState) {
+                selected.push(k + 1);
+            }
+        }
+        var typedText = textField.stringValue.js;
+
+        // If user typed something, add it
+        if (typedText && typedText.length > 0) {
+            selected.push("OTHER:" + typedText);
+        }
+
+        if (selected.length === 0) return "SKIP";
+        return selected.join("|");
     }
     return "SKIP";
 }
