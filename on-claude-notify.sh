@@ -254,37 +254,22 @@ MSSCRIPT
                 node "$_ans_tmp" "$question_text" "$result" "$option_labels" 2>/dev/null
                 rm -f "$_ans_tmp"
 
-            # ── Single-select result: "N. label"
+            # ── Single-select result: "N. label" or "OTHER:typed text"
             else
-                selected_num="${result%%.*}"
-                IFS='|' read -ra sel_labels <<< "$option_labels"
-                if [[ "$selected_num" -le "$option_count" ]]; then
-                    selected_label="${sel_labels[$((selected_num-1))]}"
+                if [[ "$result" == OTHER:* ]]; then
+                    selected_label="${result#OTHER:}"
+                    log "Typed custom answer: '$selected_label' for '$question_text'"
                 else
-                    # "Type something" selected — show text input dialog
-                    log "Type something selected, showing text input"
-                    text_result=$(osascript -l JavaScript "$GUI_SCRIPT" "$gui_text_file" 2>/dev/null) || text_result="__SKIP__"
-                    log "Text input result: '${text_result:0:80}'"
-                    if [[ "$text_result" == "__SKIP__" || -z "$text_result" ]]; then
-                        cat <<'ENDJSON'
-{
-  "hookSpecificOutput": {
-    "hookEventName": "PermissionRequest",
-    "decision": { "behavior": "allow" }
-  }
-}
-ENDJSON
-                        exit 0
-                    fi
-                    selected_label="Other"
+                    selected_num="${result%%.*}"
+                    IFS='|' read -ra sel_labels <<< "$option_labels"
+                    selected_label="${sel_labels[$((selected_num-1))]}"
+                    log "Selected: '$selected_label' for '$question_text'"
                 fi
-                log "Selected: '$selected_label' for '$question_text'"
 
                 _ans_tmp=$(mktemp)
                 cat > "$_ans_tmp" << 'ANSSCRIPT'
 const qText = process.argv[2];
 const answer = process.argv[3];
-const typedText = process.argv[4] || "";
 const r = {
     hookSpecificOutput: {
         hookEventName: "PermissionRequest",
@@ -294,14 +279,10 @@ const r = {
         }
     }
 };
-if (typedText) {
-    r.hookSpecificOutput.decision.updatedInput.answers[qText] = typedText;
-} else {
-    r.hookSpecificOutput.decision.updatedInput.answers[qText] = answer;
-}
+r.hookSpecificOutput.decision.updatedInput.answers[qText] = answer;
 console.log(JSON.stringify(r));
 ANSSCRIPT
-                node "$_ans_tmp" "$question_text" "$selected_label" "${text_result:-}" 2>/dev/null
+                node "$_ans_tmp" "$question_text" "$selected_label" 2>/dev/null
                 rm -f "$_ans_tmp"
             fi
         else
@@ -438,34 +419,35 @@ if [[ "$hook_event" == "Elicitation" ]]; then
                 ) &
 
             else
-                # Single-select
-                selected_num="${result%%.*}"
-                (
-                    sleep 0.5
-                    if [[ "$selected_num" -le "$option_count" ]]; then
-                        for (( i=1; i<selected_num; i++ )); do
-                            send_keys Down; sleep 0.1
-                        done
-                        send_keys Enter
-                    else
-                        # "Type something" — navigate to Other, select, then type
+                # Single-select: "N. label" or "OTHER:typed text"
+                if [[ "$result" == OTHER:* ]]; then
+                    typed_text="${result#OTHER:}"
+                    (
+                        sleep 0.5
+                        # Navigate to "Other" (last item)
                         for (( i=1; i<=option_count; i++ )); do
                             send_keys Down; sleep 0.1
                         done
                         send_keys Enter
                         sleep 0.3
-                        # Show text input for the typed response
-                        text_result=$(osascript -l JavaScript "$GUI_SCRIPT" "$gui_text_file" 2>/dev/null) || text_result="__SKIP__"
-                        if [[ "$text_result" != "__SKIP__" && -n "$text_result" ]]; then
-                            sleep 0.3
-                            if [[ "$HAS_TMUX" == "true" && "$pane" != "unknown" && "$pane" != "no-tmux" ]]; then
-                                tmux send-keys -t "$pane" -l "$text_result" 2>/dev/null || true
-                                tmux send-keys -t "$pane" Enter 2>/dev/null || true
-                            fi
+                        # Type the custom text
+                        if [[ "$HAS_TMUX" == "true" && "$pane" != "unknown" && "$pane" != "no-tmux" ]]; then
+                            tmux send-keys -t "$pane" -l "$typed_text" 2>/dev/null || true
+                            tmux send-keys -t "$pane" Enter 2>/dev/null || true
                         fi
-                    fi
-                    log "Sent Elicitation selection $selected_num"
-                ) &
+                        log "Sent Elicitation typed text: '$typed_text'"
+                    ) &
+                else
+                    selected_num="${result%%.*}"
+                    (
+                        sleep 0.5
+                        for (( i=1; i<selected_num; i++ )); do
+                            send_keys Down; sleep 0.1
+                        done
+                        send_keys Enter
+                        log "Sent Elicitation selection $selected_num"
+                    ) &
+                fi
             fi
         fi
     else

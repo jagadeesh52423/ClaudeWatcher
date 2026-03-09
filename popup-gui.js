@@ -100,31 +100,62 @@ function showOptions(data) {
         return showMultiSelect(data);
     }
 
-    // Add "Type something" option
-    var allOptions = options.concat(["Type something"]);
-
     var alert = $.NSAlert.alloc.init;
     alert.messageText = $(title);
     alert.informativeText = $(message);
     alert.alertStyle = $.NSAlertStyleInformational;
 
-    // Container with numbered labels + popup dropdown
+    // Container: numbered list + dropdown + "or type something" text field
     var viewWidth = 420;
+    var padding = 8;
+    var textFieldHeight = 28;
+    var textLabelHeight = 18;
     var popupHeight = 30;
-    var listHeight = allOptions.length * 22 + 8;
-    var viewHeight = listHeight + popupHeight + 16;
+    var listHeight = options.length * 22 + 8;
+    var viewHeight = listHeight + popupHeight + 12 + textLabelHeight + textFieldHeight + padding * 2;
 
     var container = $.NSView.alloc.initWithFrame(
         $.NSMakeRect(0, 0, viewWidth, viewHeight)
     );
 
+    // Text field at the very bottom
+    var textField = $.NSTextField.alloc.initWithFrame(
+        $.NSMakeRect(padding, padding, viewWidth - padding * 2, textFieldHeight)
+    );
+    textField.placeholderString = $("Type something else...");
+    textField.font = $.NSFont.systemFontOfSize(13);
+    container.addSubview(textField);
+
+    // Label for text field
+    var textLabel = $.NSTextField.alloc.initWithFrame(
+        $.NSMakeRect(padding, padding + textFieldHeight + 2, viewWidth - padding * 2, textLabelHeight)
+    );
+    textLabel.stringValue = $("Or type something:");
+    textLabel.editable = false;
+    textLabel.bordered = false;
+    textLabel.drawsBackground = false;
+    textLabel.font = $.NSFont.systemFontOfSize(11);
+    textLabel.textColor = $.NSColor.secondaryLabelColor;
+    container.addSubview(textLabel);
+
+    // Dropdown popup button above the text area
+    var popupY = padding + textFieldHeight + textLabelHeight + padding;
+    var popup = $.NSPopUpButton.alloc.initWithFramePullsDown(
+        $.NSMakeRect(padding, popupY, viewWidth - padding * 2, 28), false
+    );
+    popup.font = $.NSFont.systemFontOfSize(13);
+    for (var j = 0; j < options.length; j++) {
+        popup.addItemWithTitle($((j + 1) + ". " + options[j]));
+    }
+    container.addSubview(popup);
+
     // Numbered list as static text (for visual reference)
     var listText = "";
-    for (var i = 0; i < allOptions.length; i++) {
-        listText += (i + 1) + ".  " + allOptions[i] + "\n";
+    for (var i = 0; i < options.length; i++) {
+        listText += (i + 1) + ".  " + options[i] + "\n";
     }
     var label = $.NSTextField.alloc.initWithFrame(
-        $.NSMakeRect(8, popupHeight + 12, viewWidth - 16, listHeight)
+        $.NSMakeRect(padding, popupY + popupHeight + 4, viewWidth - padding * 2, listHeight)
     );
     label.stringValue = $(listText.trim());
     label.editable = false;
@@ -133,16 +164,6 @@ function showOptions(data) {
     label.font = $.NSFont.systemFontOfSize(13);
     label.selectable = false;
     container.addSubview(label);
-
-    // Dropdown popup button at the bottom
-    var popup = $.NSPopUpButton.alloc.initWithFramePullsDown(
-        $.NSMakeRect(8, 4, viewWidth - 16, 28), false
-    );
-    popup.font = $.NSFont.systemFontOfSize(13);
-    for (var j = 0; j < allOptions.length; j++) {
-        popup.addItemWithTitle($((j + 1) + ". " + allOptions[j]));
-    }
-    container.addSubview(popup);
 
     alert.accessoryView = container;
     alert.addButtonWithTitle($("Select"));
@@ -154,10 +175,14 @@ function showOptions(data) {
 
     var response = alert.runModal;
     if (response == 1000) {
+        // Text field takes priority — if user typed something, return that
+        var typedText = textField.stringValue.js;
+        if (typedText && typedText.length > 0) {
+            return "OTHER:" + typedText;
+        }
         var selectedIdx = popup.indexOfSelectedItem;
-        // indexOfSelectedItem could be ObjC wrapped
         var idx = parseInt("" + selectedIdx, 10);
-        return (idx + 1) + ". " + allOptions[idx];
+        return (idx + 1) + ". " + options[idx];
     }
     return "SKIP";
 }
