@@ -234,7 +234,12 @@ focus_pane() {
     if [[ "$HAS_TMUX" == "true" && -n "$pane" && "$pane" != "unknown" && "$pane" != "no-tmux" ]]; then
         local session="${pane%%:*}"
         local win_pane="${pane#*:}"
-        tmux switch-client -t "$session" 2>/dev/null || true
+        # Find the most recent attached client (needed when run outside tmux, e.g. notification click)
+        local client
+        client=$(tmux list-clients -F '#{client_name}' 2>/dev/null | head -1)
+        if [[ -n "$client" ]]; then
+            tmux switch-client -c "$client" -t "$session" 2>/dev/null || true
+        fi
         tmux select-window -t "$session:${win_pane%%.*}" 2>/dev/null || true
         tmux select-pane -t "$pane" 2>/dev/null || true
     fi

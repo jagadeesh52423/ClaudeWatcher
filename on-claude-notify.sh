@@ -195,6 +195,11 @@ find_pane_id() {
 pane=$(find_pane_id)
 project=$(basename "${cwd:-unknown}")
 
+# Clear idle guard on any non-idle event (session is active again)
+if [[ "$hook_event" != "Notification" || "$notif_type" != "idle_prompt" ]]; then
+    rm -f "$STATE_DIR/idle-notified-${pane//[:.]/_}" 2>/dev/null
+fi
+
 send_keys() {
     [[ "$HAS_TMUX" != "true" || "$pane" == "unknown" || "$pane" == "no-tmux" ]] && return 0
     local p="$pane"; shift
@@ -496,7 +501,21 @@ if [[ "$hook_event" == "Notification" ]]; then
             fi
             ;;
         idle_prompt)
-            log "Idle notification — skipping"
+            # Show idle notification only once per idle session
+            _idle_guard="$STATE_DIR/idle-notified-${pane//[:.]/_}"
+            if [[ ! -f "$_idle_guard" ]]; then
+                touch "$_idle_guard"
+                log "Idle notification — sending once"
+                if command -v terminal-notifier &>/dev/null; then
+                    _tn_args=(-title "Claude Code" -message "${message:-Session is idle}" -subtitle "$subtitle" -sound Glass -group "claude-idle-$pane")
+                    [[ -n "$_focus_cmd" ]] && _tn_args+=(-execute "$_focus_cmd")
+                    terminal-notifier "${_tn_args[@]}" &>/dev/null &
+                else
+                    osascript -e "display notification \"${message:-Session is idle}\" with title \"Claude Code\" subtitle \"$subtitle\" sound name \"Glass\"" 2>/dev/null &
+                fi
+            else
+                log "Idle notification — already sent, skipping"
+            fi
             ;;
         *)
             if command -v terminal-notifier &>/dev/null; then
