@@ -13,6 +13,47 @@
 ObjC.import("Cocoa");
 ObjC.import("stdlib");
 
+// ─── Theme Colors ────────────────────────────────────────────────────────────
+
+var THEME = {
+    // Panel background — light warm gray
+    panelBg:     [0.94, 0.94, 0.95, 1.0],
+    // Header bar — warm medium gray with subtle warmth
+    headerBg:    [0.36, 0.34, 0.38, 1.0],
+    headerText:  [1.0, 1.0, 1.0, 1.0],
+    // Section background — light card
+    sectionBg:   [0.88, 0.88, 0.90, 1.0],
+    // Text colors
+    primaryText: [0.15, 0.15, 0.18, 1.0],
+    secondaryText: [0.45, 0.45, 0.50, 1.0],
+    accentText:  [0.25, 0.48, 0.72, 1.0],
+    // Button colors — soft pastels
+    allowBtn:    [0.42, 0.75, 0.55, 1.0],   // soft mint green
+    allowBtnText:[1.0, 1.0, 1.0, 1.0],
+    alwaysBtn:   [0.50, 0.65, 0.85, 1.0],   // soft periwinkle
+    alwaysBtnText:[1.0, 1.0, 1.0, 1.0],
+    denyBtn:     [0.82, 0.50, 0.50, 1.0],   // soft coral
+    denyBtnText: [1.0, 1.0, 1.0, 1.0],
+    selectBtn:   [0.50, 0.65, 0.85, 1.0],   // soft periwinkle
+    selectBtnText:[1.0, 1.0, 1.0, 1.0],
+    skipBtn:     [0.72, 0.72, 0.75, 1.0],   // light gray
+    skipBtnText: [0.30, 0.30, 0.35, 1.0],
+    // Input fields
+    inputBg:     [1.0, 1.0, 1.0, 1.0],
+    inputText:   [0.15, 0.15, 0.18, 1.0],
+    inputBorder: [0.78, 0.78, 0.82, 1.0],
+    // Checkbox / option text
+    optionText:  [0.20, 0.20, 0.25, 1.0],
+    // Separator
+    separator:   [0.82, 0.82, 0.85, 1.0],
+    // Tool name highlight — warm teal
+    toolHighlight: [0.18, 0.55, 0.58, 1.0],
+};
+
+function nsColor(rgba) {
+    return $.NSColor.colorWithSRGBRedGreenBlueAlpha(rgba[0], rgba[1], rgba[2], rgba[3]);
+}
+
 // ─── ObjC subclasses ─────────────────────────────────────────────────────────
 
 ObjC.registerSubclass({
@@ -30,10 +71,6 @@ ObjC.registerSubclass({
 var _buttonHandler = $.PanelButtonHandler.alloc.init;
 
 // Custom NSPanel that intercepts Tab/Shift-Tab to cycle ALL controls
-// (macOS normally skips non-text controls unless system keyboard nav is on)
-// Key insight: when a text field is focused, the actual firstResponder is an
-// NSTextView (field editor), not the NSTextField itself. We must resolve it
-// back to the delegate control before following the nextKeyView chain.
 ObjC.registerSubclass({
     name: "TabPanel",
     superclass: "NSPanel",
@@ -41,25 +78,21 @@ ObjC.registerSubclass({
         "sendEvent:": {
             types: ["void", ["id"]],
             implementation: function (event) {
-                // NSEventTypeKeyDown = 10, Tab keyCode = 48
                 if (event.type == 10 && event.keyCode == 48) {
                     var fr = this.firstResponder;
                     var control = fr;
-
-                    // Resolve field editor back to actual control
                     if (fr.isKindOfClass($.NSTextView)) {
                         var delegate = fr.delegate;
                         if (delegate && delegate.isKindOfClass($.NSControl)) {
                             control = delegate;
                         }
                     }
-
                     var shift = (event.modifierFlags & $.NSEventModifierFlagShift) != 0;
                     var next = shift ? control.previousKeyView : control.nextKeyView;
                     if (next) {
                         this.makeFirstResponder(next);
                     }
-                    return; // consume Tab
+                    return;
                 }
                 ObjC.super(this).sendEvent(event);
             }
@@ -70,6 +103,8 @@ ObjC.registerSubclass({
 // Result codes
 var RC_OK = 1;
 var RC_SKIP = 2;
+var RC_DENY = 3;
+var RC_ALWAYS = 4;
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
@@ -100,40 +135,80 @@ function run(argv) {
     return "ERROR:unknown-type";
 }
 
-// ─── Permission Dialog (NSAlert — simple, no tab issues) ─────────────────────
+// ─── Permission Dialog (fully themed NSPanel) ────────────────────────────────
 
 function showPermission(data) {
     var tool = data.tool || "Unknown Tool";
     var summary = data.summary || "";
     var project = data.project || "";
 
-    var title = "Claude Code" + (project ? " — " + project : "");
-    var body = "🔧  " + tool;
+    if (summary.length > 500) summary = summary.substring(0, 497) + "...";
+
+    var W = 520, pad = 20, innerW = W - pad * 2;
+    var headerH = 52, btnH = 36, gap = 12;
+
+    // Measure summary height
+    var summaryH = summary ? measureTextHeight(summary, innerW - 20, 12) + 16 : 0;
+    var toolLblH = 28;
+
+    var totalH = headerH + gap + toolLblH + (summaryH > 0 ? gap + summaryH : 0) + gap + btnH + pad;
+
+    var panel = makeThemedPanel("Claude Code", W, totalH);
+    var cv = panel.contentView;
+    cv.wantsLayer = true;
+    var y = 0;
+
+    // --- Buttons at bottom ---
+    var denyBtn = makeThemedButton("Deny", pad, pad, 100, btnH, RC_DENY, THEME.denyBtn, THEME.denyBtnText);
+    var alwaysBtn = makeThemedButton("Always Allow", W / 2 - 65, pad, 130, btnH, RC_ALWAYS, THEME.alwaysBtn, THEME.alwaysBtnText);
+    var allowBtn = makeThemedButton("Allow Once", W - pad - 110, pad, 110, btnH, RC_OK, THEME.allowBtn, THEME.allowBtnText);
+    allowBtn.keyEquivalent = $("\r");
+    cv.addSubview(denyBtn);
+    cv.addSubview(alwaysBtn);
+    cv.addSubview(allowBtn);
+    y = pad + btnH + gap;
+
+    // --- Summary section ---
     if (summary) {
-        if (summary.length > 500) summary = summary.substring(0, 497) + "...";
-        body += "\n\n" + summary;
+        var summaryBox = $.NSBox.alloc.initWithFrame($.NSMakeRect(pad, y, innerW, summaryH));
+        summaryBox.boxType = $.NSBoxCustom;
+        summaryBox.fillColor = nsColor(THEME.sectionBg);
+        summaryBox.cornerRadius = 8;
+        summaryBox.borderWidth = 0;
+        summaryBox.contentViewMargins = $.NSMakeSize(10, 8);
+        var sLbl = makeThemedLabel(summary, 0, 0, innerW - 20, summaryH - 16, 12, THEME.secondaryText);
+        sLbl.font = $.NSFont.monospacedSystemFontOfSizeWeight(11, 0);
+        summaryBox.contentView.addSubview(sLbl);
+        cv.addSubview(summaryBox);
+        y += summaryH + gap;
     }
 
-    var alert = $.NSAlert.alloc.init;
-    alert.messageText = $(title);
-    alert.informativeText = $(body);
-    alert.alertStyle = $.NSAlertStyleWarning;
+    // --- Tool name ---
+    var toolLbl = makeThemedLabel("  " + tool, pad, y, innerW, toolLblH, 16, THEME.toolHighlight);
+    toolLbl.font = $.NSFont.boldSystemFontOfSize(16);
+    cv.addSubview(toolLbl);
+    y += toolLblH + gap;
 
-    alert.addButtonWithTitle($("Allow Once"));
-    alert.addButtonWithTitle($("Always Allow"));
-    alert.addButtonWithTitle($("Deny"));
+    // --- Header bar ---
+    var headerTitle = project ? "Permission Request — " + project : "Permission Request";
+    addHeaderBar(cv, headerTitle, W, y, headerH);
 
-    setMinWidth(alert, 480);
-    alert.window.center;
-    alert.window.setLevel($.NSStatusWindowLevel);
+    // --- Tab order ---
+    allowBtn.nextKeyView = alwaysBtn;
+    alwaysBtn.nextKeyView = denyBtn;
+    denyBtn.nextKeyView = allowBtn;
+    allowBtn.previousKeyView = denyBtn;
+    denyBtn.previousKeyView = alwaysBtn;
+    alwaysBtn.previousKeyView = allowBtn;
+    panel.initialFirstResponder = allowBtn;
 
-    var response = alert.runModal;
-    if (response == 1000) return "Allow Once";
-    if (response == 1001) return "Always Allow";
+    var rc = runPanel(panel);
+    if (rc == RC_OK) return "Allow Once";
+    if (rc == RC_ALWAYS) return "Always Allow";
     return "Deny";
 }
 
-// ─── Options Dialog (NSPanel — full Tab support) ─────────────────────────────
+// ─── Options Dialog (themed NSPanel) ─────────────────────────────────────────
 
 function showOptions(data) {
     var title = data.title || "Claude Code";
@@ -143,37 +218,34 @@ function showOptions(data) {
 
     if (data.multiSelect) return showMultiSelect(data);
 
-    var W = 500, pad = 16, innerW = W - pad * 2;
-    var btnH = 32, tfH = 28, lblH = 16, popH = 28, gap = 10;
+    var W = 520, pad = 20, innerW = W - pad * 2;
+    var headerH = 52, btnH = 36, tfH = 30, lblH = 18, popH = 30, gap = 12;
 
-    var qH = measureTextHeight(message, innerW, 13);
+    var qH = measureTextHeight(message, innerW, 13) + 4;
 
-    var totalH = pad + qH + gap + popH + gap + lblH + 4 + tfH + gap + btnH + pad;
+    var totalH = headerH + gap + qH + gap + popH + gap + lblH + 6 + tfH + gap + btnH + pad;
 
-    var panel = makePanel(title, W, totalH);
+    var panel = makeThemedPanel(title, W, totalH);
     var cv = panel.contentView;
+    cv.wantsLayer = true;
     var y = pad;
 
-    // --- Buttons at bottom ---
-    var skipBtn = makeButton("Skip", pad, y, 90, btnH, RC_SKIP);
-    var selBtn  = makeButton("Select", W - pad - 100, y, 100, btnH, RC_OK);
-    selBtn.keyEquivalent = $("\r"); // Enter = Select
+    // --- Buttons ---
+    var skipBtn = makeThemedButton("Skip", pad, y, 90, btnH, RC_SKIP, THEME.skipBtn, THEME.skipBtnText);
+    var selBtn = makeThemedButton("Select", W - pad - 110, y, 110, btnH, RC_OK, THEME.selectBtn, THEME.selectBtnText);
+    selBtn.keyEquivalent = $("\r");
     cv.addSubview(skipBtn);
     cv.addSubview(selBtn);
     y += btnH + gap;
 
     // --- Text field ---
-    var textField = $.NSTextField.alloc.initWithFrame(
-        $.NSMakeRect(pad, y, innerW, tfH)
-    );
+    var textField = makeThemedTextField(pad, y, innerW, tfH);
     textField.placeholderString = $("Or type something...");
-    textField.font = $.NSFont.systemFontOfSize(13);
     cv.addSubview(textField);
-    y += tfH + 4;
+    y += tfH + 6;
 
-    // --- "Or type something:" label ---
-    var lbl = makeLabel("Or type something:", pad, y, innerW, lblH, 11);
-    lbl.textColor = $.NSColor.secondaryLabelColor;
+    // --- Label ---
+    var lbl = makeThemedLabel("Or type something:", pad, y, innerW, lblH, 11, THEME.secondaryText);
     cv.addSubview(lbl);
     y += lblH + gap;
 
@@ -189,16 +261,19 @@ function showOptions(data) {
     y += popH + gap;
 
     // --- Question label ---
-    var qLabel = makeLabel(message, pad, y, innerW, qH, 13);
+    var qLabel = makeThemedLabel(message, pad, y, innerW, qH, 13, THEME.primaryText);
     qLabel.selectable = true;
     cv.addSubview(qLabel);
+    y += qH + gap;
 
-    // --- Tab order: popup → textField → Select → Skip → popup ---
+    // --- Header bar ---
+    addHeaderBar(cv, title, W, y, headerH);
+
+    // --- Tab order ---
     popup.nextKeyView = textField;
     textField.nextKeyView = selBtn;
     selBtn.nextKeyView = skipBtn;
     skipBtn.nextKeyView = popup;
-    // Reverse for Shift-Tab
     popup.previousKeyView = skipBtn;
     skipBtn.previousKeyView = selBtn;
     selBtn.previousKeyView = textField;
@@ -215,44 +290,41 @@ function showOptions(data) {
     return "SKIP";
 }
 
-// ─── Multi-Select Dialog (NSPanel) ───────────────────────────────────────────
+// ─── Multi-Select Dialog (themed NSPanel) ────────────────────────────────────
 
 function showMultiSelect(data) {
     var title = data.title || "Claude Code";
     var message = data.message || "Select one or more options:";
     var options = data.options || [];
 
-    var W = 500, pad = 16, innerW = W - pad * 2;
-    var btnH = 32, tfH = 28, lblH = 16, cbH = 24, gap = 10;
+    var W = 520, pad = 20, innerW = W - pad * 2;
+    var headerH = 52, btnH = 36, tfH = 30, lblH = 18, cbH = 28, gap = 12;
 
-    var qH = measureTextHeight(message, innerW, 13);
+    var qH = measureTextHeight(message, innerW, 13) + 4;
 
-    var totalH = pad + qH + gap + (options.length * cbH) + gap + lblH + 4 + tfH + gap + btnH + pad;
+    var totalH = headerH + gap + qH + gap + (options.length * cbH) + gap + lblH + 6 + tfH + gap + btnH + pad;
 
-    var panel = makePanel(title, W, totalH);
+    var panel = makeThemedPanel(title, W, totalH);
     var cv = panel.contentView;
+    cv.wantsLayer = true;
     var y = pad;
 
-    // --- Buttons at bottom ---
-    var skipBtn = makeButton("Skip", pad, y, 90, btnH, RC_SKIP);
-    var selBtn  = makeButton("Select", W - pad - 100, y, 100, btnH, RC_OK);
+    // --- Buttons ---
+    var skipBtn = makeThemedButton("Skip", pad, y, 90, btnH, RC_SKIP, THEME.skipBtn, THEME.skipBtnText);
+    var selBtn = makeThemedButton("Select", W - pad - 110, y, 110, btnH, RC_OK, THEME.selectBtn, THEME.selectBtnText);
     selBtn.keyEquivalent = $("\r");
     cv.addSubview(skipBtn);
     cv.addSubview(selBtn);
     y += btnH + gap;
 
     // --- Text field ---
-    var textField = $.NSTextField.alloc.initWithFrame(
-        $.NSMakeRect(pad, y, innerW, tfH)
-    );
+    var textField = makeThemedTextField(pad, y, innerW, tfH);
     textField.placeholderString = $("Or type something...");
-    textField.font = $.NSFont.systemFontOfSize(13);
     cv.addSubview(textField);
-    y += tfH + 4;
+    y += tfH + 6;
 
     // --- Label ---
-    var lbl = makeLabel("Or type something:", pad, y, innerW, lblH, 11);
-    lbl.textColor = $.NSColor.secondaryLabelColor;
+    var lbl = makeThemedLabel("Or type something:", pad, y, innerW, lblH, 11, THEME.secondaryText);
     cv.addSubview(lbl);
     y += lblH + gap;
 
@@ -260,12 +332,13 @@ function showMultiSelect(data) {
     var checkboxes = [];
     for (var i = options.length - 1; i >= 0; i--) {
         var cb = $.NSButton.alloc.initWithFrame(
-            $.NSMakeRect(pad, y, innerW, cbH)
+            $.NSMakeRect(pad + 4, y, innerW - 4, cbH)
         );
         cb.setButtonType($.NSSwitchButton);
         cb.title = $((i + 1) + ".  " + options[i]);
         cb.font = $.NSFont.systemFontOfSize(13);
         cb.state = $.NSOffState;
+        // Dark appearance handles text color automatically
         cv.addSubview(cb);
         checkboxes.unshift(cb);
         y += cbH;
@@ -273,11 +346,15 @@ function showMultiSelect(data) {
     y += gap;
 
     // --- Question label ---
-    var qLabel = makeLabel(message, pad, y, innerW, qH, 13);
+    var qLabel = makeThemedLabel(message, pad, y, innerW, qH, 13, THEME.primaryText);
     qLabel.selectable = true;
     cv.addSubview(qLabel);
+    y += qH + gap;
 
-    // --- Tab order: cb1 → cb2 → ... → textField → Select → Skip → cb1 ---
+    // --- Header bar ---
+    addHeaderBar(cv, title, W, y, headerH);
+
+    // --- Tab order ---
     for (var t = 0; t < checkboxes.length - 1; t++) {
         checkboxes[t].nextKeyView = checkboxes[t + 1];
         checkboxes[t + 1].previousKeyView = checkboxes[t];
@@ -306,43 +383,67 @@ function showMultiSelect(data) {
     return "SKIP";
 }
 
-// ─── Text Input Dialog (NSAlert — just a text field, Tab not needed) ─────────
+// ─── Text Input Dialog (themed NSPanel) ──────────────────────────────────────
 
 function showText(data) {
     var title = data.title || "Claude Code — Question";
     var message = data.message || "Enter your response:";
 
-    var alert = $.NSAlert.alloc.init;
-    alert.messageText = $(title);
-    alert.informativeText = $(message);
-    alert.alertStyle = $.NSAlertStyleInformational;
+    var W = 520, pad = 20, innerW = W - pad * 2;
+    var headerH = 52, btnH = 36, tfH = 80, gap = 12;
 
-    var textField = $.NSTextField.alloc.initWithFrame(
-        $.NSMakeRect(0, 0, 380, 80)
-    );
+    var qH = measureTextHeight(message, innerW, 13) + 4;
+
+    var totalH = headerH + gap + qH + gap + tfH + gap + btnH + pad;
+
+    var panel = makeThemedPanel(title, W, totalH);
+    var cv = panel.contentView;
+    cv.wantsLayer = true;
+    var y = pad;
+
+    // --- Buttons ---
+    var skipBtn = makeThemedButton("Skip", pad, y, 90, btnH, RC_SKIP, THEME.skipBtn, THEME.skipBtnText);
+    var sendBtn = makeThemedButton("Send", W - pad - 110, y, 110, btnH, RC_OK, THEME.selectBtn, THEME.selectBtnText);
+    sendBtn.keyEquivalent = $("\r");
+    cv.addSubview(skipBtn);
+    cv.addSubview(sendBtn);
+    y += btnH + gap;
+
+    // --- Text field ---
+    var textField = makeThemedTextField(pad, y, innerW, tfH);
     textField.placeholderString = $("Type your response here...");
-    textField.font = $.NSFont.systemFontOfSize(13);
+    cv.addSubview(textField);
+    y += tfH + gap;
 
-    alert.accessoryView = textField;
-    alert.addButtonWithTitle($("Send"));
-    alert.addButtonWithTitle($("Skip"));
+    // --- Question label ---
+    var qLabel = makeThemedLabel(message, pad, y, innerW, qH, 13, THEME.primaryText);
+    qLabel.selectable = true;
+    cv.addSubview(qLabel);
+    y += qH + gap;
 
-    setMinWidth(alert, 460);
-    alert.window.center;
-    alert.window.setLevel($.NSStatusWindowLevel);
-    alert.window.makeFirstResponder(textField);
+    // --- Header bar ---
+    addHeaderBar(cv, title, W, y, headerH);
 
-    var response = alert.runModal;
-    if (response == 1000) {
+    // --- Tab order ---
+    textField.nextKeyView = sendBtn;
+    sendBtn.nextKeyView = skipBtn;
+    skipBtn.nextKeyView = textField;
+    textField.previousKeyView = skipBtn;
+    skipBtn.previousKeyView = sendBtn;
+    sendBtn.previousKeyView = textField;
+    panel.initialFirstResponder = textField;
+
+    var rc = runPanel(panel);
+    if (rc == RC_OK) {
         var text = textField.stringValue.js;
         return text || "__SKIP__";
     }
     return "__SKIP__";
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Themed Helpers ──────────────────────────────────────────────────────────
 
-function makePanel(title, width, height) {
+function makeThemedPanel(title, width, height) {
     var panel = $.TabPanel.alloc.initWithContentRectStyleMaskBackingDefer(
         $.NSMakeRect(0, 0, width, height),
         $.NSTitledWindowMask | $.NSClosableWindowMask,
@@ -353,31 +454,79 @@ function makePanel(title, width, height) {
     panel.setLevel($.NSStatusWindowLevel);
     panel.center;
     panel.autorecalculatesKeyViewLoop = false;
+    panel.backgroundColor = nsColor(THEME.panelBg);
+    // Dark title bar
+    panel.titlebarAppearsTransparent = true;
+    panel.titleVisibility = $.NSWindowTitleHidden;
+    panel.appearance = $.NSAppearance.appearanceNamed($.NSAppearanceNameAqua);
     return panel;
 }
 
-function makeButton(label, x, y, w, h, tag) {
+function addHeaderBar(contentView, titleText, panelW, yPos, headerH) {
+    // Background bar
+    var bar = $.NSBox.alloc.initWithFrame($.NSMakeRect(0, yPos, panelW, headerH));
+    bar.boxType = $.NSBoxCustom;
+    bar.fillColor = nsColor(THEME.headerBg);
+    bar.borderWidth = 0;
+    contentView.addSubview(bar);
+
+    // Title text
+    var tLbl = $.NSTextField.alloc.initWithFrame($.NSMakeRect(20, yPos + 12, panelW - 40, 28));
+    tLbl.stringValue = $(titleText);
+    tLbl.editable = false;
+    tLbl.bordered = false;
+    tLbl.drawsBackground = false;
+    tLbl.textColor = nsColor(THEME.headerText);
+    tLbl.font = $.NSFont.boldSystemFontOfSize(17);
+    contentView.addSubview(tLbl);
+
+    // Separator line
+    var sep = $.NSBox.alloc.initWithFrame($.NSMakeRect(0, yPos - 1, panelW, 1));
+    sep.boxType = $.NSBoxCustom;
+    sep.fillColor = nsColor(THEME.separator);
+    sep.borderWidth = 0;
+    contentView.addSubview(sep);
+}
+
+function makeThemedButton(label, x, y, w, h, tag, bgColor, textColor) {
     var btn = $.NSButton.alloc.initWithFrame($.NSMakeRect(x, y, w, h));
-    btn.title = $(label);
     btn.bezelStyle = $.NSBezelStyleRounded;
-    btn.font = $.NSFont.systemFontOfSize(13);
+    btn.bordered = true;
+    btn.bezelColor = nsColor(bgColor);
+
+    btn.title = $(label);
+    btn.font = $.NSFont.boldSystemFontOfSize(13);
+
     btn.tag = tag;
     btn.target = _buttonHandler;
     btn.action = "buttonClicked:";
     return btn;
 }
 
-function makeLabel(text, x, y, w, h, fontSize) {
+function makeThemedLabel(text, x, y, w, h, fontSize, colorArr) {
     var lbl = $.NSTextField.alloc.initWithFrame($.NSMakeRect(x, y, w, h));
     lbl.stringValue = $(text);
     lbl.editable = false;
     lbl.bordered = false;
     lbl.drawsBackground = false;
+    lbl.textColor = nsColor(colorArr);
     lbl.font = $.NSFont.systemFontOfSize(fontSize);
     lbl.lineBreakMode = $.NSLineBreakByWordWrapping;
     lbl.usesSingleLineMode = false;
     lbl.cell.wraps = true;
     return lbl;
+}
+
+function makeThemedTextField(x, y, w, h) {
+    var tf = $.NSTextField.alloc.initWithFrame($.NSMakeRect(x, y, w, h));
+    tf.font = $.NSFont.systemFontOfSize(13);
+    tf.drawsBackground = true;
+    tf.backgroundColor = nsColor(THEME.inputBg);
+    tf.textColor = nsColor(THEME.inputText);
+    tf.bordered = true;
+    tf.bezelStyle = $.NSTextFieldRoundedBezel;
+    tf.focusRingType = $.NSFocusRingTypeNone;
+    return tf;
 }
 
 function runPanel(panel) {
