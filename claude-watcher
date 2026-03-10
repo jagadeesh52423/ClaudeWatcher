@@ -36,7 +36,7 @@ QUEUE_DIR="$STATE_DIR/popup-queue"
 LOG_FILE="$STATE_DIR/watcher.log"
 SCAN_INTERVAL="${CLAUDE_WATCHER_INTERVAL:-3}"
 SOUND_FILE="${CLAUDE_WATCHER_SOUND:-/System/Library/Sounds/Glass.aiff}"
-AUTO_FOCUS="${CLAUDE_WATCHER_AUTO_FOCUS:-true}"
+AUTO_FOCUS="${CLAUDE_WATCHER_AUTO_FOCUS:-false}"
 COOLDOWN="${CLAUDE_WATCHER_COOLDOWN:-30}"
 ACTIVE_FILE="$STATE_DIR/active"
 POPUP_SCRIPT="$WATCHER_DIR/popup-daemon"
@@ -201,14 +201,25 @@ send_notification() {
     local title="$1"
     local message="$2"
     local subtitle="${3:-}"
+    local pane="${4:-}"
 
-    osascript -e "display notification \"$message\" with title \"$title\" subtitle \"$subtitle\" sound name \"Glass\"" 2>/dev/null &
+    # Use terminal-notifier if available — clicking the notification focuses the pane
+    if command -v terminal-notifier &>/dev/null; then
+        local tn_args=(-title "$title" -message "$message" -sound Glass -group "claude-$pane")
+        [[ -n "$subtitle" ]] && tn_args+=(-subtitle "$subtitle")
+        if [[ -n "$pane" ]]; then
+            tn_args+=(-execute "$WATCHER_DIR/claude-watcher focus $pane")
+        fi
+        terminal-notifier "${tn_args[@]}" &>/dev/null &
+    else
+        osascript -e "display notification \"$message\" with title \"$title\" subtitle \"$subtitle\" sound name \"Glass\"" 2>/dev/null &
+    fi
 
     if [[ -f "$SOUND_FILE" ]]; then
         afplay "$SOUND_FILE" 2>/dev/null &
     fi
 
-    log "ALERT: $title | $message | $subtitle"
+    log "ALERT: $title | $message | $subtitle | pane=$pane"
 }
 
 # ── Focus ────────────────────────────────────────────────────────────────────
@@ -278,25 +289,25 @@ scan_once() {
         case "$state" in
             permission)
                 if should_alert "$pane" "$state"; then
-                    send_notification "Claude needs permission" "[$pane] Waiting for Allow/Deny" "$session_name"
+                    send_notification "Claude needs permission" "[$pane] Waiting for Allow/Deny" "$session_name" "$pane"
                     [[ "$AUTO_FOCUS" == "true" ]] && focus_pane "$pane"
                 fi
                 ;;
             question)
                 if should_alert "$pane" "$state"; then
-                    send_notification "Claude has a question" "[$pane] Asking you a question" "$session_name"
+                    send_notification "Claude has a question" "[$pane] Asking you a question" "$session_name" "$pane"
                     [[ "$AUTO_FOCUS" == "true" ]] && focus_pane "$pane"
                 fi
                 ;;
             plan_approval)
                 if should_alert "$pane" "$state"; then
-                    send_notification "Claude plan ready" "[$pane] Awaiting plan approval" "$session_name"
+                    send_notification "Claude plan ready" "[$pane] Awaiting plan approval" "$session_name" "$pane"
                     [[ "$AUTO_FOCUS" == "true" ]] && focus_pane "$pane"
                 fi
                 ;;
             interrupted)
                 if should_alert "$pane" "$state"; then
-                    send_notification "Claude interrupted" "[$pane] Needs direction after interrupt" "$session_name"
+                    send_notification "Claude interrupted" "[$pane] Needs direction after interrupt" "$session_name" "$pane"
                 fi
                 ;;
             idle|working|idle_with_input)

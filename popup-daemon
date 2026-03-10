@@ -139,8 +139,6 @@ APPL
             ;;
     esac
 
-    sleep 0.3
-    focus_pane "$pane"
 }
 
 # ── Dialog: question / elicitation ───────────────────────────────────────────
@@ -178,11 +176,6 @@ APPL
     if [[ -n "$result" ]]; then
         # Send the typed text (literal) followed by Enter
         send_text "$pane" "$result"
-        sleep 0.3
-        focus_pane "$pane"
-    else
-        # User skipped — just bring the pane into view
-        focus_pane "$pane"
     fi
 }
 
@@ -218,8 +211,6 @@ APPL
         *)                      send_keys "$pane" n Enter ;;
     esac
 
-    sleep 0.3
-    focus_pane "$pane"
 }
 
 # ── Process a single queue file ───────────────────────────────────────────────

@@ -479,15 +479,33 @@ if [[ "$hook_event" == "Notification" ]]; then
     subtitle="$project"
     [[ "$pane" != "unknown" && "$pane" != "no-tmux" ]] && subtitle="$pane — $project"
 
+    # Build focus command for click-to-focus
+    _focus_cmd=""
+    if [[ "$pane" != "unknown" && "$pane" != "no-tmux" ]]; then
+        _focus_cmd="$SCRIPT_DIR/claude-watcher focus $pane"
+    fi
+
     case "$notif_type" in
         permission_prompt)
-            osascript -e "display notification \"${message:-Permission needed}\" with title \"Claude Code\" subtitle \"$subtitle\" sound name \"Glass\"" 2>/dev/null &
+            if command -v terminal-notifier &>/dev/null; then
+                _tn_args=(-title "Claude Code" -message "${message:-Permission needed}" -subtitle "$subtitle" -sound Glass -group "claude-$pane")
+                [[ -n "$_focus_cmd" ]] && _tn_args+=(-execute "$_focus_cmd")
+                terminal-notifier "${_tn_args[@]}" &>/dev/null &
+            else
+                osascript -e "display notification \"${message:-Permission needed}\" with title \"Claude Code\" subtitle \"$subtitle\" sound name \"Glass\"" 2>/dev/null &
+            fi
             ;;
         idle_prompt)
             log "Idle notification — skipping"
             ;;
         *)
-            osascript -e "display notification \"${message:-Needs attention}\" with title \"Claude Code\" subtitle \"$subtitle\" sound name \"Glass\"" 2>/dev/null &
+            if command -v terminal-notifier &>/dev/null; then
+                _tn_args=(-title "Claude Code" -message "${message:-Needs attention}" -subtitle "$subtitle" -sound Glass -group "claude-$pane")
+                [[ -n "$_focus_cmd" ]] && _tn_args+=(-execute "$_focus_cmd")
+                terminal-notifier "${_tn_args[@]}" &>/dev/null &
+            else
+                osascript -e "display notification \"${message:-Needs attention}\" with title \"Claude Code\" subtitle \"$subtitle\" sound name \"Glass\"" 2>/dev/null &
+            fi
             ;;
     esac
     exit 0
