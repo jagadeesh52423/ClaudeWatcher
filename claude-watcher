@@ -72,6 +72,10 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
 }
 
+# Escape a string for safe interpolation into AppleScript double-quoted strings
+as_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+
 # ── Terminal detection ───────────────────────────────────────────────────────
 
 detect_terminal_app() {
@@ -217,7 +221,7 @@ send_notification() {
         fi
         terminal-notifier "${tn_args[@]}" &>/dev/null &
     else
-        osascript -e "display notification \"$message\" with title \"$title\" subtitle \"$subtitle\" sound name \"Glass\"" 2>/dev/null &
+        osascript -e "display notification \"$(as_escape "$message")\" with title \"$(as_escape "$title")\" subtitle \"$(as_escape "$subtitle")\" sound name \"Glass\"" 2>/dev/null &
     fi
 
     if [[ -f "$SOUND_FILE" ]]; then
@@ -425,6 +429,7 @@ cmd_start() {
 cmd_stop() {
     # Remove active flag so hooks stop sending notifications
     rm -f "$ACTIVE_FILE"
+    rm -rf "$STATE_DIR/always-allow"
 
     stop_popup_daemon
 

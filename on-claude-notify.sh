@@ -18,11 +18,15 @@
 
 STATE_DIR="/tmp/claude-watcher"
 LOG_FILE="$STATE_DIR/watcher.log"
+ALWAYS_ALLOW_DIR="$STATE_DIR/always-allow"
 ACTIVE_FILE="$STATE_DIR/active"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GUI_SCRIPT="$SCRIPT_DIR/popup-gui.js"
 
-mkdir -p "$STATE_DIR"
+mkdir -p "$STATE_DIR" "$ALWAYS_ALLOW_DIR"
+
+# Escape strings for safe interpolation in AppleScript double-quoted contexts
+as_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
 if [[ ! -f "$ACTIVE_FILE" ]]; then
     exit 0
@@ -37,6 +41,20 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] HOOK: $*" >> "$LOG_FILE"
 }
 
+check_always_allow_cache() {
+    local tool="$1"
+    local cache_file="$ALWAYS_ALLOW_DIR/$tool"
+    if [[ -f "$cache_file" ]]; then
+        local now file_age
+        now=$(date +%s)
+        file_age=$(stat -f %m "$cache_file" 2>/dev/null || echo 0)
+        if (( now - file_age < 300 )); then
+            return 0
+        fi
+        rm -f "$cache_file"
+    fi
+    return 1
+}
 
 # ── Read + parse payload in one node call ─────────────────────────────────────
 
@@ -131,6 +149,9 @@ const cwd = p.cwd || "";
 const proj = cwd ? require("path").basename(cwd) : "";
 const toolName = p.tool_name || "";
 
+// Use PID-qualified filenames to avoid race conditions with concurrent hooks
+const pid = process.pid;
+
 // Options dialog params
 if (optLabels.length > 0) {
     const optGui = JSON.stringify({
@@ -140,8 +161,8 @@ if (optLabels.length > 0) {
         options: optLabels,
         multiSelect: isMultiSelect
     });
-    fs.writeFileSync(logDir + "/gui-options.json", optGui);
-    console.log("gui_options_file=" + sq(logDir + "/gui-options.json"));
+    fs.writeFileSync(logDir + "/gui-options-" + pid + ".json", optGui);
+    console.log("gui_options_file=" + sq(logDir + "/gui-options-" + pid + ".json"));
 } else {
     console.log("gui_options_file=''");
 }
@@ -153,8 +174,8 @@ const permGui = JSON.stringify({
     summary: ts,
     project: proj
 });
-fs.writeFileSync(logDir + "/gui-permission.json", permGui);
-console.log("gui_permission_file=" + sq(logDir + "/gui-permission.json"));
+fs.writeFileSync(logDir + "/gui-permission-" + pid + ".json", permGui);
+console.log("gui_permission_file=" + sq(logDir + "/gui-permission-" + pid + ".json"));
 
 // Text dialog params
 const textGui = JSON.stringify({
@@ -162,14 +183,19 @@ const textGui = JSON.stringify({
     title: "Claude Code — Question",
     message: qText || p.message || p.prompt || "Claude is asking you a question."
 });
-fs.writeFileSync(logDir + "/gui-text.json", textGui);
-console.log("gui_text_file=" + sq(logDir + "/gui-text.json"));
+fs.writeFileSync(logDir + "/gui-text-" + pid + ".json", textGui);
+console.log("gui_text_file=" + sq(logDir + "/gui-text-" + pid + ".json"));
 NODESCRIPT
 node "$_script_tmp" <<< "$payload" > "$_parse_tmp" 2>/dev/null
 rm -f "$_script_tmp"
 # shellcheck disable=SC1090
 source "$_parse_tmp" 2>/dev/null || { rm -f "$_parse_tmp"; log "Parse failed"; exit 0; }
 rm -f "$_parse_tmp"
+
+cleanup_gui_files() {
+    rm -f "$gui_options_file" "$gui_permission_file" "$gui_text_file" 2>/dev/null
+}
+trap cleanup_gui_files EXIT
 
 log "Event: $hook_event | Tool: $tool_name | Opts: $option_count"
 
@@ -200,6 +226,7 @@ if [[ "$hook_event" != "Notification" || "$notif_type" != "idle_prompt" ]]; then
     rm -f "$STATE_DIR/idle-notified-${pane//[:.]/_}" 2>/dev/null
 fi
 
+
 send_keys() {
     [[ "$HAS_TMUX" != "true" || "$pane" == "unknown" || "$pane" == "no-tmux" ]] && return 0
     local p="$pane"; shift
@@ -211,6 +238,36 @@ send_keys() {
 # ══════════════════════════════════════════════════════════════════════════════
 
 if [[ "$hook_event" == "PermissionRequest" ]]; then
+
+    # ── Check always-allow cache (parallel request auto-approval) ──────
+    cache_key="${tool_name//[^a-zA-Z0-9_-]/_}"
+    if check_always_allow_cache "$cache_key"; then
+        log "Auto-approved $tool_name (cached always-allow)"
+        if [[ -n "$perm_suggestions" ]]; then
+            _ps_tmp=$(mktemp)
+            cat > "$_ps_tmp" << 'PSSCRIPT'
+const ps = JSON.parse(require("fs").readFileSync(0, "utf8"));
+console.log(JSON.stringify({
+    hookSpecificOutput: {
+        hookEventName: "PermissionRequest",
+        decision: { behavior: "allow", updatedPermissions: ps }
+    }
+}));
+PSSCRIPT
+            echo "$perm_suggestions" | node "$_ps_tmp" 2>/dev/null
+            rm -f "$_ps_tmp"
+        else
+            cat <<'ENDJSON'
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PermissionRequest",
+    "decision": { "behavior": "allow" }
+  }
+}
+ENDJSON
+        fi
+        exit 0
+    fi
 
     # ── Tool with dynamic options (e.g. AskUserQuestion) ─────────────────
     if [[ "$option_count" -gt 0 && -n "$gui_options_file" ]]; then
@@ -305,7 +362,41 @@ ENDJSON
 
     # ── Standard permission dialog (Deny / Allow Once / Always Allow) ────
 
+    # Record our PID so we can exclude ourselves when killing stale popups
+    echo $$ > "$ALWAYS_ALLOW_DIR/.popup-pid-$$"
+
     result=$(osascript -l JavaScript "$GUI_SCRIPT" "$gui_permission_file" 2>/dev/null) || result="Deny"
+
+    rm -f "$ALWAYS_ALLOW_DIR/.popup-pid-$$"
+
+    # If popup was killed (Deny fallback), re-check cache — another popup may have set Always Allow
+    if [[ "$result" == "Deny" ]] && check_always_allow_cache "$cache_key"; then
+        log "Auto-approved $tool_name (popup killed, cache hit)"
+        if [[ -n "$perm_suggestions" ]]; then
+            _ps_tmp=$(mktemp)
+            cat > "$_ps_tmp" << 'PSSCRIPT'
+const ps = JSON.parse(require("fs").readFileSync(0, "utf8"));
+console.log(JSON.stringify({
+    hookSpecificOutput: {
+        hookEventName: "PermissionRequest",
+        decision: { behavior: "allow", updatedPermissions: ps }
+    }
+}));
+PSSCRIPT
+            echo "$perm_suggestions" | node "$_ps_tmp" 2>/dev/null
+            rm -f "$_ps_tmp"
+        else
+            cat <<'ENDJSON'
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PermissionRequest",
+    "decision": { "behavior": "allow" }
+  }
+}
+ENDJSON
+        fi
+        exit 0
+    fi
 
     log "PermissionRequest result: '$result' for $tool_name"
 
@@ -322,10 +413,21 @@ ENDJSON
             exit 0
             ;;
         "Always Allow")
+            echo "$tool_name" > "$ALWAYS_ALLOW_DIR/$cache_key"
+            log "Cached always-allow for $cache_key"
+            # Kill other permission popup processes so they dismiss immediately
+            for pidf in "$ALWAYS_ALLOW_DIR"/.popup-pid-*; do
+                [[ -f "$pidf" ]] || continue
+                other_pid=$(cat "$pidf" 2>/dev/null) || continue
+                [[ "$other_pid" == "$$" ]] && continue
+                # Kill the osascript child of that hook process
+                pkill -P "$other_pid" -f "osascript" 2>/dev/null || true
+                log "Killed stale popup (parent PID: $other_pid)"
+            done
             if [[ -n "$perm_suggestions" ]]; then
                 _ps_tmp=$(mktemp)
                 cat > "$_ps_tmp" << 'PSSCRIPT'
-const ps = JSON.parse(process.argv[2]);
+const ps = JSON.parse(require("fs").readFileSync(0, "utf8"));
 console.log(JSON.stringify({
     hookSpecificOutput: {
         hookEventName: "PermissionRequest",
@@ -333,7 +435,7 @@ console.log(JSON.stringify({
     }
 }));
 PSSCRIPT
-                node "$_ps_tmp" "$perm_suggestions" 2>/dev/null
+                echo "$perm_suggestions" | node "$_ps_tmp" 2>/dev/null
                 rm -f "$_ps_tmp"
             else
                 cat <<'ENDJSON'
@@ -375,6 +477,17 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 
 if [[ "$hook_event" == "Elicitation" ]]; then
+    # Elicitation responses are delivered via tmux send-keys; without tmux they cannot
+    # be sent back to Claude. Warn the user and exit early.
+    if [[ "$HAS_TMUX" != "true" || "$pane" == "unknown" || "$pane" == "no-tmux" ]]; then
+        log "Elicitation skipped: tmux not available (pane=$pane), response cannot be delivered"
+        if command -v terminal-notifier &>/dev/null; then
+            terminal-notifier -title "Claude Code" -message "Elicitation requires tmux. Please respond in the terminal directly." -sound Glass &>/dev/null &
+        else
+            osascript -e 'display notification "Elicitation requires tmux. Please respond in the terminal directly." with title "Claude Code" sound name "Glass"' 2>/dev/null &
+        fi
+        exit 0
+    fi
     if [[ "$option_count" -gt 0 && -n "$gui_options_file" ]]; then
         log "Elicitation with options: '$question_text' ($option_count options, multiSelect=$multi_select)"
 
@@ -497,7 +610,7 @@ if [[ "$hook_event" == "Notification" ]]; then
                 [[ -n "$_focus_cmd" ]] && _tn_args+=(-execute "$_focus_cmd")
                 terminal-notifier "${_tn_args[@]}" &>/dev/null &
             else
-                osascript -e "display notification \"${message:-Permission needed}\" with title \"Claude Code\" subtitle \"$subtitle\" sound name \"Glass\"" 2>/dev/null &
+                osascript -e "display notification \"$(as_escape "${message:-Permission needed}")\" with title \"Claude Code\" subtitle \"$(as_escape "$subtitle")\" sound name \"Glass\"" 2>/dev/null &
             fi
             ;;
         idle_prompt)
@@ -511,7 +624,7 @@ if [[ "$hook_event" == "Notification" ]]; then
                     [[ -n "$_focus_cmd" ]] && _tn_args+=(-execute "$_focus_cmd")
                     terminal-notifier "${_tn_args[@]}" &>/dev/null &
                 else
-                    osascript -e "display notification \"${message:-Session is idle}\" with title \"Claude Code\" subtitle \"$subtitle\" sound name \"Glass\"" 2>/dev/null &
+                    osascript -e "display notification \"$(as_escape "${message:-Session is idle}")\" with title \"Claude Code\" subtitle \"$(as_escape "$subtitle")\" sound name \"Glass\"" 2>/dev/null &
                 fi
             else
                 log "Idle notification — already sent, skipping"
@@ -523,7 +636,7 @@ if [[ "$hook_event" == "Notification" ]]; then
                 [[ -n "$_focus_cmd" ]] && _tn_args+=(-execute "$_focus_cmd")
                 terminal-notifier "${_tn_args[@]}" &>/dev/null &
             else
-                osascript -e "display notification \"${message:-Needs attention}\" with title \"Claude Code\" subtitle \"$subtitle\" sound name \"Glass\"" 2>/dev/null &
+                osascript -e "display notification \"$(as_escape "${message:-Needs attention}")\" with title \"Claude Code\" subtitle \"$(as_escape "$subtitle")\" sound name \"Glass\"" 2>/dev/null &
             fi
             ;;
     esac
