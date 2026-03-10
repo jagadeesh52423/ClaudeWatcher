@@ -17,6 +17,11 @@
 
 set -euo pipefail
 
+# Ensure Homebrew tools (tmux, terminal-notifier, node) are in PATH
+for p in /opt/homebrew/bin /usr/local/bin; do
+    [[ -d "$p" && ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
+done
+
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 # Resolve symlinks to find the real script location
 while [[ -L "$SCRIPT_PATH" ]]; do
