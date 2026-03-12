@@ -174,21 +174,7 @@ detect_pane_state() {
         fi
     fi
 
-    # ── Priority 3: Plan approval ──
-    if echo "$last_lines" | grep -qi 'awaiting.*approval\|approve.*plan\|Yes.*proceed\|Approve\|Start implementation'; then
-        echo "plan_approval"
-        return
-    fi
-
-    # ── Priority 4: Interrupted ──
-    if echo "$last_lines" | grep -q 'Interrupted'; then
-        if echo "$content" | tail -10 | grep -q 'Interrupted'; then
-            echo "interrupted"
-            return
-        fi
-    fi
-
-    # ── Priority 5: Idle ──
+    # ── Priority 3: Idle ──
     if echo "$last_lines" | grep -qE '(\? for shortcuts|⏵⏵ accept edits)'; then
         local prompt_line
         prompt_line=$(echo "$content" | grep -E '^❯' | tail -1 || true)
@@ -198,6 +184,20 @@ detect_pane_state() {
         fi
         echo "idle_with_input"
         return
+    fi
+
+    # ── Priority 4: Plan approval ──
+    if echo "$last_lines" | grep -qi 'awaiting.*approval\|approve.*plan\|Yes.*proceed\|Approve\|Start implementation'; then
+        echo "plan_approval"
+        return
+    fi
+
+    # ── Priority 5: Interrupted ──
+    if echo "$last_lines" | grep -q 'Interrupted'; then
+        if echo "$content" | tail -10 | grep -q 'Interrupted'; then
+            echo "interrupted"
+            return
+        fi
     fi
 
     # ── Default: working ──
@@ -485,8 +485,8 @@ cmd_status() {
             local suffix=""
             [[ "$pane" == "$our_pane" ]] && suffix=" ${DIM}← you${NC}"
 
-            printf "  ${color}%s${NC} ${BOLD}%-28s${NC} ${color}%-18s${NC}%s\n" \
-                "$icon" "$pane" "$label" "$suffix"
+            printf "  %b%s%b %b%-28s%b %b%-18s%b%b\n" \
+                "$color" "$icon" "$NC" "$BOLD" "$pane" "$NC" "$color" "$label" "$NC" "$suffix"
         done < <(find_claude_panes)
 
         if [[ $count -eq 0 ]]; then
