@@ -1,0 +1,9 @@
+{
+  "name": "claude-watcher",
+  "version": "2.0.0",
+  "description": "Monitor Claude Code sessions with NATS queue-based popup management",
+  "private": true,
+  "dependencies": {
+    "nats": "^2.28.0"
+  }
+}

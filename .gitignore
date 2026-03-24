@@ -1,3 +1,4 @@
 .claude/
-/tmp/
 *.log
+/tmp/
+node_modules/

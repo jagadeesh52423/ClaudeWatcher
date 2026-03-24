@@ -35,7 +35,7 @@ WATCHER_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
 STATE_DIR="/tmp/claude-watcher"
 PID_FILE="$STATE_DIR/watcher.pid"
-POPUP_PID_FILE="$STATE_DIR/popup.pid"
+POPUP_PID_FILE="$STATE_DIR/daemon.pid"
 ALERTS_DIR="$STATE_DIR/alerts"
 QUEUE_DIR="$STATE_DIR/popup-queue"
 LOG_FILE="$STATE_DIR/watcher.log"
@@ -44,9 +44,14 @@ SOUND_FILE="${CLAUDE_WATCHER_SOUND:-/System/Library/Sounds/Glass.aiff}"
 AUTO_FOCUS="${CLAUDE_WATCHER_AUTO_FOCUS:-false}"
 COOLDOWN="${CLAUDE_WATCHER_COOLDOWN:-30}"
 ACTIVE_FILE="$STATE_DIR/active"
-POPUP_SCRIPT="$WATCHER_DIR/popup-daemon"
+SESSION_STATE_DIR="$STATE_DIR/session-state"
+POPUP_SCRIPT="$WATCHER_DIR/popup-daemon.js"
+QUEUE_HOOKS_DIR="$STATE_DIR/queue/hooks"
+QUEUE_SCANNER_DIR="$STATE_DIR/queue/scanner"
+REPLY_DIR="$STATE_DIR/reply"
+DAEMON_STATUS_FILE="$STATE_DIR/daemon-status.json"
 
-mkdir -p "$STATE_DIR" "$ALERTS_DIR" "$QUEUE_DIR"
+mkdir -p "$STATE_DIR" "$ALERTS_DIR" "$QUEUE_DIR" "$SESSION_STATE_DIR" "$QUEUE_HOOKS_DIR" "$QUEUE_SCANNER_DIR" "$REPLY_DIR"
 
 # Detect tmux availability
 HAS_TMUX=false
@@ -175,7 +180,23 @@ detect_pane_state() {
     fi
 
     # ── Priority 3: Idle ──
+    # Detect idle by either:
+    #   a) Classic indicators (? for shortcuts / ⏵⏵ accept edits) visible, OR
+    #   b) An empty ❯ prompt followed by the status bar (Model: line)
+    local has_classic_idle=false
     if echo "$last_lines" | grep -qE '(\? for shortcuts|⏵⏵ accept edits)'; then
+        has_classic_idle=true
+    fi
+
+    local has_empty_prompt=false
+    # Check if the last ❯ line is empty (no user input yet) and status bar is visible
+    if echo "$last_lines" | grep -qE '^❯\s*$'; then
+        if echo "$last_lines" | grep -qE '^\s+Model:'; then
+            has_empty_prompt=true
+        fi
+    fi
+
+    if [[ "$has_classic_idle" == "true" || "$has_empty_prompt" == "true" ]]; then
         local prompt_line
         prompt_line=$(echo "$content" | grep -E '^❯' | tail -1 || true)
         if [[ -z "$prompt_line" ]] || [[ "${prompt_line}" =~ ^❯[[:space:]]*$ ]]; then
@@ -285,6 +306,43 @@ clear_alert() {
     rm -f "$alert_file"
 }
 
+# ── NATS publishing helper ───────────────────────────────────────────────────
+
+# Publish a JSON message to a NATS subject.
+# Falls back to writing to a file queue directory if NATS is unavailable.
+# Usage: nats_publish <subject> <json_payload> <fallback_dir>
+nats_publish() {
+    local subject="$1"
+    local payload="$2"
+    local fallback_dir="$3"
+
+    local _ts
+    _ts=$(node -e "process.stdout.write(String(Date.now()))" 2>/dev/null || echo "$(date +%s)000")
+
+    # Node connect has its own 2s timeout — no external timeout needed
+    if node -e "
+        const nats = require('nats');
+        (async () => {
+            try {
+                const nc = await nats.connect({ servers: 'nats://localhost:4222', timeout: 2000 });
+                nc.publish('${subject}', Buffer.from(JSON.stringify(JSON.parse(process.argv[1]))));
+                await nc.flush();
+                await nc.close();
+            } catch (e) {
+                process.exit(1);
+            }
+        })();
+    " "$payload" 2>/dev/null; then
+        return 0
+    else
+        # NATS unavailable — write to file queue fallback
+        mkdir -p "$fallback_dir"
+        echo "$payload" > "${fallback_dir}/${_ts}-scanner-$$.json"
+        log "NATS unavailable, wrote to file queue: ${fallback_dir}/${_ts}-scanner-$$.json"
+        return 1
+    fi
+}
+
 # ── Scanner (tmux only) ─────────────────────────────────────────────────────
 
 scan_once() {
@@ -303,24 +361,73 @@ scan_once() {
         case "$state" in
             permission)
                 if should_alert "$pane" "$state"; then
+                    # Publish to NATS scanner subject, fall back to file queue
+                    local scanner_payload
+                    scanner_payload=$(node -e "process.stdout.write(JSON.stringify({
+                        type: 'scanner',
+                        state: 'permission',
+                        pane: process.argv[1],
+                        session_name: process.argv[2],
+                        message: 'Waiting for Allow/Deny',
+                        timestamp: Date.now()
+                    }))" "$pane" "$session_name" 2>/dev/null || echo "")
+                    if [[ -n "$scanner_payload" ]]; then
+                        nats_publish "claude.scanner" "$scanner_payload" "$QUEUE_SCANNER_DIR" 2>/dev/null || true
+                    fi
                     send_notification "Claude needs permission" "[$pane] Waiting for Allow/Deny" "$session_name" "$pane"
                     [[ "$AUTO_FOCUS" == "true" ]] && focus_pane "$pane"
                 fi
                 ;;
             question)
                 if should_alert "$pane" "$state"; then
+                    local scanner_payload
+                    scanner_payload=$(node -e "process.stdout.write(JSON.stringify({
+                        type: 'scanner',
+                        state: 'question',
+                        pane: process.argv[1],
+                        session_name: process.argv[2],
+                        message: 'Asking you a question',
+                        timestamp: Date.now()
+                    }))" "$pane" "$session_name" 2>/dev/null || echo "")
+                    if [[ -n "$scanner_payload" ]]; then
+                        nats_publish "claude.scanner" "$scanner_payload" "$QUEUE_SCANNER_DIR" 2>/dev/null || true
+                    fi
                     send_notification "Claude has a question" "[$pane] Asking you a question" "$session_name" "$pane"
                     [[ "$AUTO_FOCUS" == "true" ]] && focus_pane "$pane"
                 fi
                 ;;
             plan_approval)
                 if should_alert "$pane" "$state"; then
+                    local scanner_payload
+                    scanner_payload=$(node -e "process.stdout.write(JSON.stringify({
+                        type: 'scanner',
+                        state: 'plan_approval',
+                        pane: process.argv[1],
+                        session_name: process.argv[2],
+                        message: 'Awaiting plan approval',
+                        timestamp: Date.now()
+                    }))" "$pane" "$session_name" 2>/dev/null || echo "")
+                    if [[ -n "$scanner_payload" ]]; then
+                        nats_publish "claude.scanner" "$scanner_payload" "$QUEUE_SCANNER_DIR" 2>/dev/null || true
+                    fi
                     send_notification "Claude plan ready" "[$pane] Awaiting plan approval" "$session_name" "$pane"
                     [[ "$AUTO_FOCUS" == "true" ]] && focus_pane "$pane"
                 fi
                 ;;
             interrupted)
                 if should_alert "$pane" "$state"; then
+                    local scanner_payload
+                    scanner_payload=$(node -e "process.stdout.write(JSON.stringify({
+                        type: 'scanner',
+                        state: 'interrupted',
+                        pane: process.argv[1],
+                        session_name: process.argv[2],
+                        message: 'Needs direction after interrupt',
+                        timestamp: Date.now()
+                    }))" "$pane" "$session_name" 2>/dev/null || echo "")
+                    if [[ -n "$scanner_payload" ]]; then
+                        nats_publish "claude.scanner" "$scanner_payload" "$QUEUE_SCANNER_DIR" 2>/dev/null || true
+                    fi
                     send_notification "Claude interrupted" "[$pane] Needs direction after interrupt" "$session_name" "$pane"
                 fi
                 ;;
@@ -345,15 +452,10 @@ run_loop() {
 }
 
 start_popup_daemon() {
-    if [[ ! -f "$POPUP_SCRIPT" ]]; then
-        log "popup-daemon script not found at $POPUP_SCRIPT — skipping"
-        return 0
-    fi
     if [[ -f "$POPUP_PID_FILE" ]] && kill -0 "$(cat "$POPUP_PID_FILE")" 2>/dev/null; then
         return 0  # already running
     fi
-    chmod +x "$POPUP_SCRIPT"
-    nohup "$POPUP_SCRIPT" >> "$LOG_FILE" 2>&1 &
+    nohup node "$POPUP_SCRIPT" >> "$LOG_FILE" 2>&1 &
     echo $! > "$POPUP_PID_FILE"
     log "Popup daemon started (PID: $!)"
 }
@@ -430,6 +532,11 @@ cmd_stop() {
     # Remove active flag so hooks stop sending notifications
     rm -f "$ACTIVE_FILE"
     rm -rf "$STATE_DIR/always-allow"
+    rm -rf "$SESSION_STATE_DIR"
+    rm -rf "$REPLY_DIR"
+
+    # Recreate directories for clean state
+    mkdir -p "$QUEUE_HOOKS_DIR" "$QUEUE_SCANNER_DIR" "$REPLY_DIR" "$SESSION_STATE_DIR"
 
     stop_popup_daemon
 
@@ -460,12 +567,92 @@ cmd_status() {
 
     local count=0
     local attention_count=0
+    local now
+    now=$(date +%s)
+    local stale_threshold=300  # 5 minutes
 
+    # Clean up state files older than 2 hours
+    find "$SESSION_STATE_DIR" -type f -mmin +120 -delete 2>/dev/null || true
+
+    # ── Primary source: hook-based session state files ──
+    local seen_panes=()
+    local has_state_files=false
+
+    for state_file in "$SESSION_STATE_DIR"/*; do
+        [[ -f "$state_file" ]] || continue
+        has_state_files=true
+
+        # Source the key=value file into local vars
+        local s_state="" s_pane="" s_project="" s_session_id="" s_tool="" s_message="" s_timestamp=""
+        while IFS='=' read -r key val; do
+            case "$key" in
+                state)      s_state="$val" ;;
+                pane)       s_pane="$val" ;;
+                project)    s_project="$val" ;;
+                session_id) s_session_id="$val" ;;
+                tool)       s_tool="$val" ;;
+                message)    s_message="$val" ;;
+                timestamp)  s_timestamp="$val" ;;
+            esac
+        done < "$state_file"
+
+        [[ -z "$s_state" ]] && continue
+
+        # Check staleness
+        local age=$(( now - ${s_timestamp:-0} ))
+        if [[ $age -gt $stale_threshold ]]; then
+            s_state="stale"
+        fi
+
+        count=$((count + 1))
+        [[ -n "$s_pane" ]] && seen_panes+=("$s_pane")
+
+        local icon color label
+        case "$s_state" in
+            permission)    icon="⚠ " ; color="$RED"     ; label="NEEDS PERMISSION"  ; attention_count=$((attention_count + 1)) ;;
+            question)      icon="? " ; color="$YELLOW"   ; label="ASKING QUESTION"   ; attention_count=$((attention_count + 1)) ;;
+            idle)          icon="◯ " ; color="$CYAN"     ; label="IDLE"              ;;
+            working)       icon="● " ; color="$GREEN"    ; label="WORKING"           ;;
+            stale)         icon="◌ " ; color="$DIM"      ; label="STALE"             ;;
+            *)             icon="? " ; color="$DIM"      ; label="UNKNOWN"           ;;
+        esac
+
+        # Build display name: prefer "pane — project", fall back to project
+        local display_name="${s_project:-unknown}"
+        if [[ -n "$s_pane" && "$s_pane" != "no-tmux" && "$s_pane" != "unknown" ]]; then
+            display_name="$s_pane"
+        fi
+
+        local tool_info=""
+        [[ -n "$s_tool" && "$s_state" != "idle" && "$s_state" != "stale" ]] && tool_info=" ${DIM}($s_tool)${NC}"
+
+        # Check if this is our own pane
+        local suffix=""
+        if [[ "$HAS_TMUX" == "true" ]]; then
+            local our_pane
+            our_pane=$(get_own_pane)
+            [[ "$s_pane" == "$our_pane" ]] && suffix=" ${DIM}← you${NC}"
+        fi
+
+        printf "  %b%s%b %b%-28s%b %b%-18s%b%b%b\n" \
+            "$color" "$icon" "$NC" "$BOLD" "$display_name" "$NC" "$color" "$label" "$NC" "$tool_info" "$suffix"
+    done
+
+    # ── Fallback: tmux panes not covered by state files ──
     if [[ "$HAS_TMUX" == "true" ]]; then
         local our_pane
         our_pane=$(get_own_pane)
 
         while IFS='|' read -r pane pid attached; do
+            [[ "$pane" == "$our_pane" ]] && continue
+
+            # Skip panes already reported via state files
+            local already_seen=false
+            for sp in "${seen_panes[@]+"${seen_panes[@]}"}"; do
+                [[ "$sp" == "$pane" ]] && { already_seen=true; break; }
+            done
+            [[ "$already_seen" == "true" ]] && continue
+
             count=$((count + 1))
             local state
             state=$(detect_pane_state "$pane")
@@ -482,31 +669,13 @@ cmd_status() {
                 *)             icon="? " ; color="$DIM"      ; label="UNKNOWN"           ;;
             esac
 
-            local suffix=""
-            [[ "$pane" == "$our_pane" ]] && suffix=" ${DIM}← you${NC}"
-
-            printf "  %b%s%b %b%-28s%b %b%-18s%b%b\n" \
-                "$color" "$icon" "$NC" "$BOLD" "$pane" "$NC" "$color" "$label" "$NC" "$suffix"
+            printf "  %b%s%b %b%-28s%b %b%-18s%b ${DIM}(tmux)${NC}\n" \
+                "$color" "$icon" "$NC" "$BOLD" "$pane" "$NC" "$color" "$label" "$NC"
         done < <(find_claude_panes)
+    fi
 
-        if [[ $count -eq 0 ]]; then
-            echo -e "  ${DIM}No Claude sessions found in tmux${NC}"
-        fi
-    else
-        echo -e "  ${DIM}tmux not available — session scanning disabled${NC}"
-
-        # Show Claude processes running in any terminal
-        local claude_procs
-        claude_procs=$(pgrep -af "claude" 2>/dev/null | grep -v "claude-watcher\|popup-daemon\|on-claude-notify" || true)
-        if [[ -n "$claude_procs" ]]; then
-            echo -e "  ${DIM}Claude processes detected:${NC}"
-            while IFS= read -r proc; do
-                echo -e "    ${GREEN}●${NC} ${DIM}$proc${NC}"
-                count=$((count + 1))
-            done <<< "$claude_procs"
-        else
-            echo -e "  ${DIM}No Claude processes detected${NC}"
-        fi
+    if [[ $count -eq 0 ]]; then
+        echo -e "  ${DIM}No Claude sessions found${NC}"
     fi
 
     echo ""
@@ -528,21 +697,60 @@ cmd_status() {
     fi
     if [[ -f "$POPUP_PID_FILE" ]] && kill -0 "$(cat "$POPUP_PID_FILE")" 2>/dev/null; then
         local queue_count
-        queue_count=$(ls "$QUEUE_DIR"/*.popup 2>/dev/null | wc -l | tr -d ' ')
+        queue_count=$(find "$QUEUE_DIR" -maxdepth 1 -name "*.popup" 2>/dev/null | wc -l | tr -d ' ')
         echo -e "  ${GREEN}●${NC} Popup daemon:   ${GREEN}running${NC} (PID: $(cat "$POPUP_PID_FILE")) | queue: $queue_count"
     else
         echo -e "  ${DIM}○ Popup daemon:   not running${NC}"
     fi
 
-    # Mode info
-    if [[ "$HAS_TMUX" == "true" ]]; then
-        echo -e "  ${DIM}  Mode: full (scanner + hooks + popup)${NC}"
-    else
-        echo -e "  ${DIM}  Mode: hooks-only (popup dialogs for permissions & questions)${NC}"
+    # ── NATS / Daemon status from daemon-status.json ──
+    if [[ -f "$DAEMON_STATUS_FILE" ]]; then
+        echo ""
+        echo -e "  ${BOLD}Daemon Status${NC} ${DIM}(from daemon-status.json)${NC}"
+
+        local d_nats d_queue_depth d_active_popup d_uptime d_pid d_heartbeat
+        d_nats=$(node -e "try { const d=JSON.parse(require('fs').readFileSync('$DAEMON_STATUS_FILE','utf8')); process.stdout.write(d.nats||'unknown'); } catch(e) { process.stdout.write('error'); }" 2>/dev/null || echo "error")
+        d_queue_depth=$(node -e "try { const d=JSON.parse(require('fs').readFileSync('$DAEMON_STATUS_FILE','utf8')); process.stdout.write(String(d.queueDepth!=null?d.queueDepth:'?')); } catch(e) { process.stdout.write('?'); }" 2>/dev/null || echo "?")
+        d_active_popup=$(node -e "try { const d=JSON.parse(require('fs').readFileSync('$DAEMON_STATUS_FILE','utf8')); process.stdout.write(d.activePopup||'none'); } catch(e) { process.stdout.write('?'); }" 2>/dev/null || echo "?")
+        d_uptime=$(node -e "try { const d=JSON.parse(require('fs').readFileSync('$DAEMON_STATUS_FILE','utf8')); process.stdout.write(String(d.uptime!=null?d.uptime:'?')); } catch(e) { process.stdout.write('?'); }" 2>/dev/null || echo "?")
+        d_pid=$(node -e "try { const d=JSON.parse(require('fs').readFileSync('$DAEMON_STATUS_FILE','utf8')); process.stdout.write(String(d.pid||'?')); } catch(e) { process.stdout.write('?'); }" 2>/dev/null || echo "?")
+        d_heartbeat=$(node -e "try { const d=JSON.parse(require('fs').readFileSync('$DAEMON_STATUS_FILE','utf8')); process.stdout.write(String(d.lastHeartbeat||0)); } catch(e) { process.stdout.write('0'); }" 2>/dev/null || echo "0")
+
+        # Check if daemon is alive (heartbeat within 30s)
+        local now_ms
+        now_ms=$(node -e "process.stdout.write(String(Date.now()))" 2>/dev/null || echo "0")
+        local heartbeat_age_s=999
+        if [[ "$d_heartbeat" != "0" && "$now_ms" != "0" ]]; then
+            heartbeat_age_s=$(( (now_ms - d_heartbeat) / 1000 ))
+        fi
+
+        local daemon_alive_label
+        if [[ $heartbeat_age_s -le 30 ]]; then
+            daemon_alive_label="${GREEN}alive${NC} (heartbeat ${heartbeat_age_s}s ago)"
+        else
+            daemon_alive_label="${RED}DEAD${NC} (last heartbeat ${heartbeat_age_s}s ago)"
+        fi
+
+        # NATS status color
+        local nats_color="$DIM"
+        case "$d_nats" in
+            connected)    nats_color="$GREEN" ;;
+            disconnected) nats_color="$RED" ;;
+            file-only)    nats_color="$YELLOW" ;;
+        esac
+
+        echo -e "    NATS:          ${nats_color}${d_nats}${NC}"
+        echo -e "    Queue depth:   ${d_queue_depth}"
+        echo -e "    Active popup:  ${d_active_popup}"
+        echo -e "    Uptime:        ${d_uptime}s"
+        echo -e "    Daemon PID:    ${d_pid}"
+        printf "    Daemon health: "
+        echo -e "  ${daemon_alive_label}"
     fi
 
     # Summary
     if [[ $attention_count -gt 0 ]]; then
+        echo ""
         echo -e "  ${RED}${BOLD}$attention_count session(s) need your attention!${NC}"
     fi
 
@@ -566,7 +774,26 @@ cmd_focus() {
         return
     fi
 
-    # Auto-find first session needing attention
+    # Check hook-based state files first for sessions needing attention
+    for state_file in "$SESSION_STATE_DIR"/*; do
+        [[ -f "$state_file" ]] || continue
+        local s_state="" s_pane=""
+        while IFS='=' read -r key val; do
+            case "$key" in
+                state) s_state="$val" ;;
+                pane)  s_pane="$val" ;;
+            esac
+        done < "$state_file"
+        if [[ "$s_state" == "permission" || "$s_state" == "question" ]]; then
+            if [[ -n "$s_pane" && "$s_pane" != "no-tmux" && "$s_pane" != "unknown" ]]; then
+                focus_pane "$s_pane"
+                echo -e "${GREEN}Focused: $s_pane${NC} ($s_state)"
+                return
+            fi
+        fi
+    done
+
+    # Fallback: scan tmux panes
     while IFS='|' read -r pane pid attached; do
         local state
         state=$(detect_pane_state "$pane")
@@ -622,17 +849,25 @@ cmd_install() {
             });
         }
 
-        // PreToolUse: Claude reads allow/deny decisions from stdout
-        addHook('PreToolUse', '');
-
-        // Notification: macOS notification for permission_prompt
-        addHook('Notification', 'permission_prompt');
-
-        // Elicitation: text-input dialog, response via stdout
-        addHook('Elicitation', '');
-
-        // PermissionRequest: fallback focus
+        // All 12 hook event types (matcher "" = match all)
         addHook('PermissionRequest', '');
+        addHook('Elicitation', '');
+        addHook('PreToolUse', '');
+        addHook('PostToolUse', '');
+        addHook('PostToolUseFailure', '');
+        addHook('Stop', '');
+        addHook('SessionEnd', '');
+        addHook('UserPromptSubmit', '');
+        addHook('SubagentStart', '');
+        addHook('SubagentStop', '');
+        addHook('TeammateIdle', '');
+        addHook('TaskCompleted', '');
+
+        // Notification with 4 separate matchers
+        addHook('Notification', 'permission_prompt');
+        addHook('Notification', 'idle_prompt');
+        addHook('Notification', 'elicitation_dialog');
+        addHook('Notification', 'auth_success');
 
         fs.writeFileSync('$settings_file', JSON.stringify(settings, null, 2));
 NODESCRIPT
@@ -640,6 +875,12 @@ NODESCRIPT
     echo -e "${GREEN}Hooks installed successfully!${NC}"
     echo -e "${DIM}  Settings: $settings_file${NC}"
     echo -e "${DIM}  Handler:  $hook_script${NC}"
+    echo ""
+    echo -e "  ${DIM}Registered 12 event types + 4 Notification matchers:${NC}"
+    echo -e "  ${DIM}  PermissionRequest, Elicitation, PreToolUse, PostToolUse,${NC}"
+    echo -e "  ${DIM}  PostToolUseFailure, Stop, SessionEnd, UserPromptSubmit,${NC}"
+    echo -e "  ${DIM}  SubagentStart, SubagentStop, TeammateIdle, TaskCompleted${NC}"
+    echo -e "  ${DIM}  Notification: permission_prompt, idle_prompt, elicitation_dialog, auth_success${NC}"
     echo ""
     if [[ "$HAS_TMUX" == "true" ]]; then
         echo -e "  ${DIM}Mode: full (scanner + hooks + popup dialogs)${NC}"
