@@ -623,17 +623,12 @@ function handleNotification(envelope) {
             showMacNotification('Claude Code', message || 'Permission needed', subtitle);
             break;
         case 'idle_prompt': {
-            // Update session state
+            // DISABLED: No notification for idle sessions
+            // Update session state only
             writeSessionState(sessionId, 'idle', pane, project, '', message || 'Session is idle');
-            // Dedup: once per idle per pane
             const paneKey = pane.replace(/[:\.]/g, '_');
-            if (!idleNotifiedPanes.has(paneKey)) {
-                idleNotifiedPanes.add(paneKey);
-                showMacNotification('Claude Code', message || 'Session is idle', subtitle);
-                log(`Idle notification sent for pane ${pane}`);
-            } else {
-                log(`Idle notification already sent for pane ${pane}, skipping`);
-            }
+            idleNotifiedPanes.add(paneKey);
+            log(`Idle state updated for pane ${pane} (notification disabled)`);
             break;
         }
         case 'elicitation_dialog':
@@ -655,11 +650,12 @@ function handleNotification(envelope) {
         case 'plan_approved':
         case 'plan_rejected':
         case 'exit_plan_mode': {
-            // Plan resolved - clear tracking
+            // DISABLED: No notification for plan approval/rejection
+            // Clear tracking only
             const paneKey = pane.replace(/[:\.]/g, '_');
             planModeNotifiedPanes.delete(paneKey);
             writeSessionState(sessionId, 'working', pane, project, '', message || 'Plan mode exited');
-            log(`Plan mode cleared for pane ${pane}`);
+            log(`Plan mode cleared for pane ${pane} (notification disabled)`);
             break;
         }
         default:
