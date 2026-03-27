@@ -142,7 +142,7 @@ function showPermission(data) {
     var summary = data.summary || "";
     var project = data.project || "";
 
-    if (summary.length > 500) summary = summary.substring(0, 497) + "...";
+    if (summary.length > 800) summary = summary.substring(0, 797) + "...";
 
     var W = 520, pad = 20, innerW = W - pad * 2;
     var headerH = 52, btnH = 36, gap = 12;
