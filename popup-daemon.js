@@ -83,7 +83,7 @@ const startTime = Date.now();
 function log(msg) {
     const ts = new Date().toISOString();
     const line = `[${ts}] [popup-daemon] ${msg}`;
-    console.error(line);
+    try { console.error(line); } catch (_) { /* ignore EPIPE */ }
     try {
         fs.appendFileSync(path.join(BASE_DIR, 'watcher.log'), line + '\n');
     } catch (_) { /* ignore */ }
@@ -193,12 +193,13 @@ function setAlwaysAllow(toolName) {
 
 // ─── Reply Delivery ─────────────────────────────────────────────────────────
 
-function buildPermissionReply(behavior, message) {
+function buildPermissionReply(behavior, extras) {
     const decision = { behavior };
-    if (behavior === 'allow') {
-        decision.updatedPermissions = [];
+    if (extras && extras.updatedPermissions) {
+        decision.updatedPermissions = extras.updatedPermissions;
     }
-    if (message) decision.message = message;
+    if (extras && extras.message) decision.message = extras.message;
+    if (extras && extras.updatedInput) decision.updatedInput = extras.updatedInput;
     return {
         hookSpecificOutput: {
             hookEventName: 'PermissionRequest',
@@ -453,14 +454,13 @@ function enqueueEvent(envelope, priority, source) {
     markSeen(eventId);
 
     // Non-popup events: handle immediately
-    if (!isPopupEvent(eventType) && !isDropEvent(eventType) && !isCleanupEvent(eventType)) {
-        handleStateOnlyEvent(envelope);
-        return;
-    }
-
-    // PostToolUse: drop logic
-    if (eventType === 'PostToolUse') {
-        handlePostToolUse(envelope);
+    if (!isPopupEvent(eventType) && !isCleanupEvent(eventType)) {
+        // PostToolUse: update session state only, no queue dropping
+        if (eventType === 'PostToolUse') {
+            handlePostToolUse(envelope);
+        } else {
+            handleStateOnlyEvent(envelope);
+        }
         return;
     }
 
@@ -510,9 +510,6 @@ function isPopupEvent(type) {
     return type === 'PermissionRequest' || type === 'Elicitation';
 }
 
-function isDropEvent(type) {
-    return type === 'PostToolUse';
-}
 
 function isCleanupEvent(type) {
     return type === 'SessionEnd';
@@ -662,87 +659,17 @@ function showMacNotification(title, message, subtitle) {
 // ─── PostToolUse Drop Logic ─────────────────────────────────────────────────
 
 function handlePostToolUse(envelope) {
-    const sessionId = envelope.session_id;
-    const toolName = envelope.tool_name;
     const cwd = envelope.cwd || '';
     const project = cwd ? path.basename(cwd) : '';
     const pane = envelope.raw_payload?.pane || envelope.pane || '';
     const message = envelope.raw_payload?.message || envelope.message || '';
+    const sessionId = envelope.session_id;
+    const toolName = envelope.tool_name;
 
-    // Update session state
+    // Update session state only — queue items are removed when their reply is delivered
     writeSessionState(sessionId, 'working', pane, project, toolName, message);
-
-    if (!sessionId || !toolName) return;
-
-    // Drop all matching entries from both queues
-    dropMatchingEntries(sessionId, toolName);
-
-    // Drop matching file-queue entries (read content to confirm tool_name)
-    dropMatchingFileQueueEntries(sessionId, toolName);
-
-    // Handle active popup
-    if (activePopup && activePopup.entry &&
-        activePopup.entry.session_id === sessionId &&
-        activePopup.entry.tool_name === toolName) {
-        log(`PostToolUse: active popup matches ${toolName}@${sessionId}, marking auto-resolvable`);
-        activePopup.autoResolvable = true;
-        if (!activePopup.autoResolveTimer) {
-            activePopup.autoResolveTimer = setTimeout(() => {
-                if (activePopup && activePopup.autoResolvable) {
-                    autoResolveActivePopup('allow');
-                }
-            }, POST_TOOL_USE_AUTO_RESOLVE_MS);
-        }
-    }
-
-    tryNextPopup();
 }
 
-function dropMatchingEntries(sessionId, toolName) {
-    const dropFromQueue = (queue, queueName) => {
-        const dropped = [];
-        for (let i = queue.length - 1; i >= 0; i--) {
-            if (queue[i].session_id === sessionId && queue[i].tool_name === toolName) {
-                const entry = queue.splice(i, 1)[0];
-                dropped.push(entry);
-            }
-        }
-        for (const entry of dropped) {
-            log(`Dropped ${entry.type} [${entry.entryId}] from ${queueName} (PostToolUse match)`);
-            // Send safe-default reply for blocking hooks
-            if (entry.type === 'PermissionRequest' || entry.type === 'Elicitation') {
-                const reply = safeDefaultReply(entry.type);
-                if (reply) deliverReply(entry.entryId, reply);
-            }
-        }
-        return dropped.length;
-    };
-
-    const highDropped = dropFromQueue(highPriorityQueue, 'highPriorityQueue');
-    const lowDropped = dropFromQueue(lowPriorityQueue, 'lowPriorityQueue');
-    if (highDropped + lowDropped > 0) {
-        log(`PostToolUse dropped ${highDropped + lowDropped} entries for ${toolName}@${sessionId}`);
-    }
-}
-
-function dropMatchingFileQueueEntries(sessionId, toolName) {
-    for (const dir of [QUEUE_HOOKS_DIR, QUEUE_SCANNER_DIR]) {
-        try {
-            const files = fs.readdirSync(dir).filter(f => f.endsWith('.json'));
-            for (const file of files) {
-                const filePath = path.join(dir, file);
-                try {
-                    const content = fs.readFileSync(filePath, 'utf8');
-                    const data = JSON.parse(content);
-                    if (data.session_id === sessionId && data.tool_name === toolName) {
-                        fs.unlinkSync(filePath);
-                        log(`Dropped file queue entry ${file} (PostToolUse match)`);
-                    }
-                } catch (_) { /* skip unreadable files */ }
-            }
-        } catch (_) { /* dir may not exist */ }
-    }
-}
 
 // ─── SessionEnd Cleanup ─────────────────────────────────────────────────────
 
@@ -905,7 +832,30 @@ function tryNextPopup() {
 function showPermissionPopup(entry) {
     const raw = entry.raw_payload || {};
     const tool = entry.tool_name || raw.tool_name || 'Unknown Tool';
-    const summary = raw.tool_input_summary || raw.summary || '';
+    const toolInput = raw.tool_input || {};
+
+    // Check if this is a tool with dynamic options (e.g., AskUserQuestion)
+    const questions = toolInput.questions || [];
+    if (questions.length > 0 && questions[0].options && questions[0].options.length > 0) {
+        return showPermissionWithOptions(entry, tool, questions[0], raw);
+    }
+
+    // Build summary from actual Claude Code payload fields
+    let summary = '';
+    if (toolInput.description) {
+        summary = toolInput.description;
+    }
+    if (toolInput.command) {
+        summary += (summary ? '\n\n' : '') + toolInput.command;
+    } else if (toolInput.file_path) {
+        summary += (summary ? '\n\n' : '') + toolInput.file_path;
+    }
+    if (!summary && Object.keys(toolInput).length > 0) {
+        const s = JSON.stringify(toolInput);
+        summary = s.length > 500 ? s.slice(0, 497) + '...' : s;
+        if (summary === '{}') summary = '';
+    }
+
     const cwd = entry.cwd || raw.cwd || '';
     const project = cwd ? path.basename(cwd) : '';
 
@@ -918,7 +868,6 @@ function showPermissionPopup(entry) {
 
     runPopup(entry, params, (result) => {
         if (!result || result === 'ERROR:timeout' || result.startsWith('ERROR:')) {
-            // Default to allow on error/timeout
             log(`Permission popup error/timeout for ${tool}, defaulting to allow`);
             const reply = buildPermissionReply('allow');
             deliverReply(entry.entryId, reply);
@@ -927,48 +876,117 @@ function showPermissionPopup(entry) {
             deliverReply(entry.entryId, reply);
         } else if (result === 'Always Allow') {
             setAlwaysAllow(tool);
-            const reply = buildPermissionReply('allow');
+            const permSuggestions = raw.permission_suggestions || [];
+            const reply = buildPermissionReply('allow', {
+                updatedPermissions: permSuggestions.length > 0 ? permSuggestions : undefined,
+            });
             deliverReply(entry.entryId, reply);
         } else if (result === 'Deny') {
-            const reply = buildPermissionReply('deny');
+            const reply = buildPermissionReply('deny', { message: 'User denied via popup' });
             deliverReply(entry.entryId, reply);
         } else {
-            // Unknown result, default allow
             const reply = buildPermissionReply('allow');
             deliverReply(entry.entryId, reply);
         }
     });
 }
 
+function showPermissionWithOptions(entry, tool, question, raw) {
+    const qText = question.question || question.header || '';
+    const options = (question.options || []).map(o => o.label || o.value || String(o));
+    const isMultiSelect = !!question.multiSelect;
+
+    const params = {
+        type: 'options',
+        title: 'Claude Code' + (tool ? ' \u2014 ' + tool : ''),
+        message: qText || 'Choose an option:',
+        options,
+        multiSelect: isMultiSelect,
+    };
+
+    runPopup(entry, params, (result) => {
+        if (!result || result === 'SKIP' || result.startsWith('ERROR:')) {
+            const reply = buildPermissionReply('allow');
+            deliverReply(entry.entryId, reply);
+            return;
+        }
+
+        let answer;
+        if (isMultiSelect) {
+            const parts = result.split('|');
+            const selected = [];
+            parts.forEach(p => {
+                if (p.startsWith('OTHER:')) {
+                    selected.push(p.slice(6));
+                } else {
+                    const idx = parseInt(p, 10) - 1;
+                    if (idx >= 0 && idx < options.length) selected.push(options[idx]);
+                }
+            });
+            answer = selected.join(', ');
+        } else if (result.startsWith('OTHER:')) {
+            answer = result.slice(6);
+        } else {
+            const match = result.match(/^(\d+)\.\s+(.+)$/);
+            answer = match ? match[2] : result;
+        }
+
+        const reply = buildPermissionReply('allow');
+        reply.hookSpecificOutput.decision.updatedInput = { answers: {} };
+        reply.hookSpecificOutput.decision.updatedInput.answers[qText] = answer;
+        deliverReply(entry.entryId, reply);
+    });
+}
+
 function showElicitationPopup(entry) {
     const raw = entry.raw_payload || {};
 
-    // Determine popup type from elicitation data
     const elicitationData = raw.elicitation || raw;
     const schema = elicitationData.schema || {};
     const title = elicitationData.title || raw.title || 'Claude Code';
-    const message = elicitationData.message || elicitationData.description || raw.message || 'Please respond:';
+    const message = elicitationData.message || elicitationData.description ||
+                    raw.message || raw.prompt || 'Please respond:';
+
+    // Extract options from multiple locations (matching old hook handler)
+    let options = [];
+    let isMultiSelect = false;
+
+    // 1. schema.enum
+    if (schema.enum && schema.enum.length > 0) {
+        options = schema.enum;
+    }
+    // 2. questions[0].options
+    if (options.length === 0 && raw.questions && raw.questions[0]) {
+        const q = raw.questions[0];
+        isMultiSelect = !!q.multiSelect;
+        (q.options || []).forEach(o => {
+            options.push(o.label || o.value || String(o));
+        });
+    }
+    // 3. top-level options array
+    if (options.length === 0 && Array.isArray(raw.options)) {
+        raw.options.forEach(o => {
+            options.push(typeof o === 'string' ? o : (o.label || o.value || String(o)));
+        });
+    }
 
     let params;
 
-    if (schema.enum && schema.enum.length > 0) {
-        // Options popup
+    if (options.length > 0) {
         params = {
             type: 'options',
             title,
             message,
-            options: schema.enum,
-            multiSelect: false,
+            options,
+            multiSelect: isMultiSelect,
         };
     } else if (schema.type === 'string') {
-        // Free-text popup
         params = {
             type: 'text',
             title,
             message,
         };
     } else {
-        // Default to options or text based on available data
         params = {
             type: 'text',
             title,
@@ -1018,6 +1036,19 @@ function runPopup(entry, params, callback) {
     };
 
     log(`Showing popup: ${entry.type} ${entry.tool_name || ''} [${entry.entryId}]`);
+
+    // Play a sound when the popup appears (async, fire-and-forget)
+    try {
+        log(`Playing sound: Glass.aiff`);
+        const soundProc = spawn('afplay', ['/System/Library/Sounds/Glass.aiff'], {
+            stdio: 'ignore',
+            detached: true
+        });
+        soundProc.on('error', (e) => log(`Sound error: ${e.message}`));
+        soundProc.unref();
+    } catch (e) {
+        log(`Failed to spawn sound: ${e.message}`);
+    }
 
     // Use spawn for async popup execution
     const child = spawn('osascript', ['-l', 'JavaScript', POPUP_GUI_PATH, paramsFilePath], {
@@ -1208,6 +1239,7 @@ async function main() {
     process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));
     process.on('uncaughtException', (err) => {
+        if (err.code === 'EPIPE') return; // ignore broken pipe — stdout/stderr closed
         log(`Uncaught exception: ${err.message}\n${err.stack}`);
     });
     process.on('unhandledRejection', (reason) => {
