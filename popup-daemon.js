@@ -63,6 +63,7 @@ const pendingReplies = new Map(); // entryId -> PendingReply
 const recentEventIds = new Map(); // eventId -> expiryTimestamp
 const alwaysAllowCache = new Map(); // toolName -> expiryTimestamp
 const idleNotifiedPanes = new Set(); // pane ids that have been idle-notified
+const planModeNotifiedPanes = new Map(); // pane -> { notified: boolean, timestamp: number }
 
 let natsConnection = null;
 let natsStatus = 'disconnected'; // 'connected' | 'disconnected' | 'file-only'
@@ -177,6 +178,12 @@ function cleanupDedupSet() {
 }
 
 // ─── Always-Allow Cache ─────────────────────────────────────────────────────
+
+// ─── Always-Allow Cache (DEPRECATED) ───────────────────────────────────────
+// NOTE: Client-side "Always Allow" caching is disabled. We rely entirely on
+// Claude Code's permission system. When user presses "Always Allow", we send
+// updatedPermissions to Claude Code, and it handles future requests.
+// Keeping these functions for potential future use, but they are not called.
 
 function isAlwaysAllowed(toolName) {
     if (!toolName) return false;
@@ -597,6 +604,15 @@ function handleNotification(envelope) {
         idleNotifiedPanes.delete(paneKey);
     }
 
+    // Clear plan mode tracking on non-plan events
+    if (!notifType.includes('plan') && notifType !== 'enter_plan_mode' && notifType !== 'exit_plan_mode') {
+        const paneKey = pane.replace(/[:\.]/g, '_');
+        if (planModeNotifiedPanes.has(paneKey)) {
+            planModeNotifiedPanes.delete(paneKey);
+            log(`Plan mode auto-cleared for pane ${pane} (activity detected)`);
+        }
+    }
+
     let subtitle = project;
     if (pane && pane !== 'unknown' && pane !== 'no-tmux') {
         subtitle = `${pane} — ${project}`;
@@ -626,6 +642,26 @@ function handleNotification(envelope) {
         case 'auth_success':
             showMacNotification('Claude Code', message || 'Authentication successful', subtitle);
             break;
+        case 'plan_created':
+        case 'enter_plan_mode': {
+            // Claude entered plan mode - notify user to review
+            writeSessionState(sessionId, 'plan-mode', pane, project, '', message || 'Plan created');
+            const paneKey = pane.replace(/[:\.]/g, '_');
+            planModeNotifiedPanes.set(paneKey, { notified: true, timestamp: Date.now() });
+            showMacNotification('Claude Code', message || 'Plan created - review needed', subtitle);
+            log(`Plan mode notification sent for pane ${pane}`);
+            break;
+        }
+        case 'plan_approved':
+        case 'plan_rejected':
+        case 'exit_plan_mode': {
+            // Plan resolved - clear tracking
+            const paneKey = pane.replace(/[:\.]/g, '_');
+            planModeNotifiedPanes.delete(paneKey);
+            writeSessionState(sessionId, 'working', pane, project, '', message || 'Plan mode exited');
+            log(`Plan mode cleared for pane ${pane}`);
+            break;
+        }
         default:
             showMacNotification('Claude Code', message || 'Needs attention', subtitle);
             break;
@@ -808,15 +844,8 @@ function tryNextPopup() {
 
     // Only popup events should be in the queue at this point
     if (entry.type === 'PermissionRequest') {
-        // Check always-allow cache
-        if (isAlwaysAllowed(entry.tool_name)) {
-            log(`Auto-allowing ${entry.tool_name} (always-allow cache hit)`);
-            const reply = buildPermissionReply('allow');
-            deliverReply(entry.entryId, reply);
-            // Process next
-            setImmediate(tryNextPopup);
-            return;
-        }
+        // Note: We rely on Claude Code's permission system for "Always Allow"
+        // No client-side pattern matching or auto-approval
         showPermissionPopup(entry);
     } else if (entry.type === 'Elicitation') {
         showElicitationPopup(entry);
@@ -875,7 +904,7 @@ function showPermissionPopup(entry) {
             const reply = buildPermissionReply('allow');
             deliverReply(entry.entryId, reply);
         } else if (result === 'Always Allow') {
-            setAlwaysAllow(tool);
+            // Send updatedPermissions to Claude Code - let it handle future permissions
             const permSuggestions = raw.permission_suggestions || [];
             const reply = buildPermissionReply('allow', {
                 updatedPermissions: permSuggestions.length > 0 ? permSuggestions : undefined,
