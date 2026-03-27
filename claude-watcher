@@ -410,7 +410,8 @@ scan_once() {
                     if [[ -n "$scanner_payload" ]]; then
                         nats_publish "claude.scanner" "$scanner_payload" "$QUEUE_SCANNER_DIR" 2>/dev/null || true
                     fi
-                    send_notification "Claude plan ready" "[$pane] Awaiting plan approval" "$session_name" "$pane"
+                    # DISABLED: Scanner plan approval notifications (too frequent)
+                    # send_notification "Claude plan ready" "[$pane] Awaiting plan approval" "$session_name" "$pane"
                     [[ "$AUTO_FOCUS" == "true" ]] && focus_pane "$pane"
                 fi
                 ;;
