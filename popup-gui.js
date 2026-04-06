@@ -70,35 +70,9 @@ ObjC.registerSubclass({
 
 var _buttonHandler = $.PanelButtonHandler.alloc.init;
 
-// Custom NSPanel that intercepts Tab/Shift-Tab to cycle ALL controls
-ObjC.registerSubclass({
-    name: "TabPanel",
-    superclass: "NSPanel",
-    methods: {
-        "sendEvent:": {
-            types: ["void", ["id"]],
-            implementation: function (event) {
-                if (event.type == 10 && event.keyCode == 48) {
-                    var fr = this.firstResponder;
-                    var control = fr;
-                    if (fr.isKindOfClass($.NSTextView)) {
-                        var delegate = fr.delegate;
-                        if (delegate && delegate.isKindOfClass($.NSControl)) {
-                            control = delegate;
-                        }
-                    }
-                    var shift = (event.modifierFlags & $.NSEventModifierFlagShift) != 0;
-                    var next = shift ? control.previousKeyView : control.nextKeyView;
-                    if (next) {
-                        this.makeFirstResponder(next);
-                    }
-                    return;
-                }
-                ObjC.super(this).sendEvent(event);
-            }
-        }
-    }
-});
+// NOTE: Previously used a custom TabPanel NSPanel subclass to intercept Tab/Shift-Tab,
+// but ObjC.super(this).sendEvent(event) causes infinite recursion on macOS 26+.
+// Using plain NSPanel instead — manual key view loop still works via nextKeyView/previousKeyView.
 
 // Result codes
 var RC_OK = 1;
@@ -444,7 +418,7 @@ function showText(data) {
 // ─── Themed Helpers ──────────────────────────────────────────────────────────
 
 function makeThemedPanel(title, width, height) {
-    var panel = $.TabPanel.alloc.initWithContentRectStyleMaskBackingDefer(
+    var panel = $.NSPanel.alloc.initWithContentRectStyleMaskBackingDefer(
         $.NSMakeRect(0, 0, width, height),
         $.NSTitledWindowMask | $.NSClosableWindowMask,
         $.NSBackingStoreBuffered,
