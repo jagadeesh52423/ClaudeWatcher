@@ -49,6 +49,8 @@ POPUP_SCRIPT="$WATCHER_DIR/popup-daemon.js"
 QUEUE_HOOKS_DIR="$STATE_DIR/queue/hooks"
 QUEUE_SCANNER_DIR="$STATE_DIR/queue/scanner"
 REPLY_DIR="$STATE_DIR/reply"
+QUEUE_SERVER_SCRIPT="$WATCHER_DIR/queue-server.js"
+QUEUE_SERVER_PID_FILE="$STATE_DIR/queue-server.pid"
 DAEMON_STATUS_FILE="$STATE_DIR/daemon-status.json"
 
 mkdir -p "$STATE_DIR" "$ALERTS_DIR" "$QUEUE_DIR" "$SESSION_STATE_DIR" "$QUEUE_HOOKS_DIR" "$QUEUE_SCANNER_DIR" "$REPLY_DIR"
@@ -306,39 +308,25 @@ clear_alert() {
     rm -f "$alert_file"
 }
 
-# ── NATS publishing helper ───────────────────────────────────────────────────
+# ── Queue publishing helper ──────────────────────────────────────────────────
 
-# Publish a JSON message to a NATS subject.
-# Falls back to writing to a file queue directory if NATS is unavailable.
-# Usage: nats_publish <subject> <json_payload> <fallback_dir>
-nats_publish() {
-    local subject="$1"
+# Publish a JSON message to the queue server via queue-publish.js.
+# Falls back to writing to a file queue directory if server is unavailable.
+# Usage: queue_publish <channel> <json_payload> <fallback_dir>
+queue_publish() {
+    local channel="$1"
     local payload="$2"
     local fallback_dir="$3"
 
     local _ts
     _ts=$(node -e "process.stdout.write(String(Date.now()))" 2>/dev/null || echo "$(date +%s)000")
 
-    # Node connect has its own 2s timeout — no external timeout needed
-    if node -e "
-        const nats = require('nats');
-        (async () => {
-            try {
-                const nc = await nats.connect({ servers: 'nats://localhost:4222', timeout: 2000 });
-                nc.publish('${subject}', Buffer.from(JSON.stringify(JSON.parse(process.argv[1]))));
-                await nc.flush();
-                await nc.close();
-            } catch (e) {
-                process.exit(1);
-            }
-        })();
-    " "$payload" 2>/dev/null; then
+    if echo "$payload" | node "$WATCHER_DIR/queue-publish.js" --channel "$channel" 2>/dev/null; then
         return 0
     else
-        # NATS unavailable — write to file queue fallback
         mkdir -p "$fallback_dir"
         echo "$payload" > "${fallback_dir}/${_ts}-scanner-$$.json"
-        log "NATS unavailable, wrote to file queue: ${fallback_dir}/${_ts}-scanner-$$.json"
+        log "Queue unavailable, wrote to file: ${fallback_dir}/${_ts}-scanner-$$.json"
         return 1
     fi
 }
@@ -361,7 +349,7 @@ scan_once() {
         case "$state" in
             permission)
                 if should_alert "$pane" "$state"; then
-                    # Publish to NATS scanner subject, fall back to file queue
+                    # Publish to queue server scanner channel, fall back to file queue
                     local scanner_payload
                     scanner_payload=$(node -e "process.stdout.write(JSON.stringify({
                         type: 'scanner',
@@ -372,7 +360,7 @@ scan_once() {
                         timestamp: Date.now()
                     }))" "$pane" "$session_name" 2>/dev/null || echo "")
                     if [[ -n "$scanner_payload" ]]; then
-                        nats_publish "claude.scanner" "$scanner_payload" "$QUEUE_SCANNER_DIR" 2>/dev/null || true
+                        queue_publish "scanner" "$scanner_payload" "$QUEUE_SCANNER_DIR" 2>/dev/null || true
                     fi
                     send_notification "Claude needs permission" "[$pane] Waiting for Allow/Deny" "$session_name" "$pane"
                     [[ "$AUTO_FOCUS" == "true" ]] && focus_pane "$pane"
@@ -390,7 +378,7 @@ scan_once() {
                         timestamp: Date.now()
                     }))" "$pane" "$session_name" 2>/dev/null || echo "")
                     if [[ -n "$scanner_payload" ]]; then
-                        nats_publish "claude.scanner" "$scanner_payload" "$QUEUE_SCANNER_DIR" 2>/dev/null || true
+                        queue_publish "scanner" "$scanner_payload" "$QUEUE_SCANNER_DIR" 2>/dev/null || true
                     fi
                     send_notification "Claude has a question" "[$pane] Asking you a question" "$session_name" "$pane"
                     [[ "$AUTO_FOCUS" == "true" ]] && focus_pane "$pane"
@@ -408,7 +396,7 @@ scan_once() {
                         timestamp: Date.now()
                     }))" "$pane" "$session_name" 2>/dev/null || echo "")
                     if [[ -n "$scanner_payload" ]]; then
-                        nats_publish "claude.scanner" "$scanner_payload" "$QUEUE_SCANNER_DIR" 2>/dev/null || true
+                        queue_publish "scanner" "$scanner_payload" "$QUEUE_SCANNER_DIR" 2>/dev/null || true
                     fi
                     # DISABLED: Scanner plan approval notifications (too frequent)
                     # send_notification "Claude plan ready" "[$pane] Awaiting plan approval" "$session_name" "$pane"
@@ -427,7 +415,7 @@ scan_once() {
                         timestamp: Date.now()
                     }))" "$pane" "$session_name" 2>/dev/null || echo "")
                     if [[ -n "$scanner_payload" ]]; then
-                        nats_publish "claude.scanner" "$scanner_payload" "$QUEUE_SCANNER_DIR" 2>/dev/null || true
+                        queue_publish "scanner" "$scanner_payload" "$QUEUE_SCANNER_DIR" 2>/dev/null || true
                     fi
                     send_notification "Claude interrupted" "[$pane] Needs direction after interrupt" "$session_name" "$pane"
                 fi
@@ -446,8 +434,17 @@ run_loop() {
     echo $$ > "$PID_FILE"
     log "Watcher started (PID: $$, interval: ${SCAN_INTERVAL}s, tmux: $HAS_TMUX)"
 
+    local _keepalive_tick=0
     while true; do
         scan_once 2>/dev/null || true
+
+        # Keepalive: every ~30s, restart queue server / popup daemon if they died
+        (( _keepalive_tick++ )) || true
+        if (( _keepalive_tick % 10 == 0 )); then
+            start_queue_server 2>/dev/null || true
+            start_popup_daemon 2>/dev/null || true
+        fi
+
         sleep "$SCAN_INTERVAL"
     done
 }
@@ -474,6 +471,29 @@ stop_popup_daemon() {
     rm -f "$POPUP_PID_FILE"
 }
 
+start_queue_server() {
+    if [[ -f "$QUEUE_SERVER_PID_FILE" ]] && kill -0 "$(cat "$QUEUE_SERVER_PID_FILE" 2>/dev/null)" 2>/dev/null; then
+        return 0  # already running
+    fi
+    nohup node "$QUEUE_SERVER_SCRIPT" >> "$LOG_FILE" 2>&1 &
+    echo $! > "$QUEUE_SERVER_PID_FILE"
+    log "Queue server started (PID: $!)"
+    sleep 0.3  # brief wait for server to bind to port
+}
+
+stop_queue_server() {
+    if [[ ! -f "$QUEUE_SERVER_PID_FILE" ]]; then
+        return 0
+    fi
+    local pid
+    pid=$(cat "$QUEUE_SERVER_PID_FILE" 2>/dev/null || true)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid"
+        log "Queue server stopped (PID: $pid)"
+    fi
+    rm -f "$QUEUE_SERVER_PID_FILE"
+}
+
 cmd_start() {
     local daemon=false
     [[ "${1:-}" == "-d" || "${1:-}" == "--daemon" ]] && daemon=true
@@ -483,7 +503,19 @@ cmd_start() {
 
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
         echo -e "${YELLOW}Watcher already running (PID: $(cat "$PID_FILE"))${NC}"
-        return 1
+        # Scanner is alive — but ensure queue server and popup daemon are running too
+        local _restarted=false
+        if ! { [[ -f "$QUEUE_SERVER_PID_FILE" ]] && kill -0 "$(cat "$QUEUE_SERVER_PID_FILE" 2>/dev/null)" 2>/dev/null; }; then
+            start_queue_server
+            echo -e "${GREEN}  Queue server restarted${NC} (PID: $(cat "$QUEUE_SERVER_PID_FILE" 2>/dev/null || echo '?'))"
+            _restarted=true
+        fi
+        if ! { [[ -f "$POPUP_PID_FILE" ]] && kill -0 "$(cat "$POPUP_PID_FILE")" 2>/dev/null; }; then
+            start_popup_daemon
+            echo -e "${GREEN}  Popup daemon restarted${NC} (PID: $(cat "$POPUP_PID_FILE" 2>/dev/null || echo '?'))"
+            _restarted=true
+        fi
+        return 0
     fi
 
     local pane_count=0
@@ -503,6 +535,8 @@ cmd_start() {
         else
             echo -e "${DIM}  Scanner skipped (tmux not available)${NC}"
         fi
+        start_queue_server
+        echo -e "${GREEN}  Queue server started${NC} (PID: $(cat "$QUEUE_SERVER_PID_FILE" 2>/dev/null || echo '?'))"
         start_popup_daemon
         echo -e "${GREEN}  Popup daemon started${NC} (PID: $(cat "$POPUP_PID_FILE" 2>/dev/null || echo '?'))"
         echo -e "${GREEN}  Hooks active${NC} (PermissionRequest + Elicitation respond via GUI popup)"
@@ -515,12 +549,13 @@ cmd_start() {
             echo -e "${DIM}Hooks mode (no tmux) — popup dialogs for permissions & questions${NC}"
         fi
         echo ""
+        start_queue_server
         start_popup_daemon
         if [[ "$HAS_TMUX" == "true" ]]; then
             run_loop
         else
             # No scanner loop needed — just keep the popup daemon alive
-            trap 'stop_popup_daemon; rm -f "$ACTIVE_FILE"; log "Watcher stopped (no-tmux)"; exit 0' INT TERM
+            trap 'stop_popup_daemon; stop_queue_server; rm -f "$ACTIVE_FILE"; log "Watcher stopped (no-tmux)"; exit 0' INT TERM
             log "Watcher started in hooks-only mode (no tmux)"
             echo -e "${DIM}Running in hooks-only mode. Popup daemon handles GUI dialogs.${NC}"
             echo -e "${DIM}Press Ctrl+C to stop.${NC}"
@@ -540,6 +575,7 @@ cmd_stop() {
     mkdir -p "$QUEUE_HOOKS_DIR" "$QUEUE_SCANNER_DIR" "$REPLY_DIR" "$SESSION_STATE_DIR"
 
     stop_popup_daemon
+    stop_queue_server
 
     if [[ ! -f "$PID_FILE" ]]; then
         echo -e "${GREEN}Notifications disabled${NC}"
@@ -704,13 +740,13 @@ cmd_status() {
         echo -e "  ${DIM}○ Popup daemon:   not running${NC}"
     fi
 
-    # ── NATS / Daemon status from daemon-status.json ──
+    # ── Daemon status from daemon-status.json ──
     if [[ -f "$DAEMON_STATUS_FILE" ]]; then
         echo ""
         echo -e "  ${BOLD}Daemon Status${NC} ${DIM}(from daemon-status.json)${NC}"
 
-        local d_nats d_queue_depth d_active_popup d_uptime d_pid d_heartbeat
-        d_nats=$(node -e "try { const d=JSON.parse(require('fs').readFileSync('$DAEMON_STATUS_FILE','utf8')); process.stdout.write(d.nats||'unknown'); } catch(e) { process.stdout.write('error'); }" 2>/dev/null || echo "error")
+        local d_transport d_queue_depth d_active_popup d_uptime d_pid d_heartbeat
+        d_transport=$(node -e "try { const d=JSON.parse(require('fs').readFileSync('$DAEMON_STATUS_FILE','utf8')); process.stdout.write(d.transport||'unknown'); } catch(e) { process.stdout.write('error'); }" 2>/dev/null || echo "error")
         d_queue_depth=$(node -e "try { const d=JSON.parse(require('fs').readFileSync('$DAEMON_STATUS_FILE','utf8')); process.stdout.write(String(d.queueDepth!=null?d.queueDepth:'?')); } catch(e) { process.stdout.write('?'); }" 2>/dev/null || echo "?")
         d_active_popup=$(node -e "try { const d=JSON.parse(require('fs').readFileSync('$DAEMON_STATUS_FILE','utf8')); process.stdout.write(d.activePopup||'none'); } catch(e) { process.stdout.write('?'); }" 2>/dev/null || echo "?")
         d_uptime=$(node -e "try { const d=JSON.parse(require('fs').readFileSync('$DAEMON_STATUS_FILE','utf8')); process.stdout.write(String(d.uptime!=null?d.uptime:'?')); } catch(e) { process.stdout.write('?'); }" 2>/dev/null || echo "?")
@@ -732,15 +768,14 @@ cmd_status() {
             daemon_alive_label="${RED}DEAD${NC} (last heartbeat ${heartbeat_age_s}s ago)"
         fi
 
-        # NATS status color
-        local nats_color="$DIM"
-        case "$d_nats" in
-            connected)    nats_color="$GREEN" ;;
-            disconnected) nats_color="$RED" ;;
-            file-only)    nats_color="$YELLOW" ;;
+        # Transport status color
+        local transport_color="$DIM"
+        case "$d_transport" in
+            queue)        transport_color="$GREEN" ;;
+            file-only)    transport_color="$YELLOW" ;;
         esac
 
-        echo -e "    NATS:          ${nats_color}${d_nats}${NC}"
+        echo -e "    Transport:     ${transport_color}${d_transport}${NC}"
         echo -e "    Queue depth:   ${d_queue_depth}"
         echo -e "    Active popup:  ${d_active_popup}"
         echo -e "    Uptime:        ${d_uptime}s"

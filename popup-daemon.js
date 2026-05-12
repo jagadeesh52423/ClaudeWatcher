@@ -5,7 +5,7 @@
 // popup-daemon.js — Single consumer daemon for Claude Code hook events.
 //
 // Replaces the old bash popup-daemon. Manages a priority queue of hook events,
-// shows one popup at a time via popup-gui.js, handles NATS + file-queue transport,
+// shows one popup at a time via popup-gui.js, handles HTTP queue + file-queue transport,
 // and maintains session state files.
 //
 
@@ -27,13 +27,7 @@ const STATUS_FILE = path.join(BASE_DIR, 'daemon-status.json');
 
 const POPUP_GUI_PATH = path.join(__dirname, 'popup-gui.js');
 
-const NATS_URL = 'nats://localhost:4222';
-const NATS_CONNECT_RETRIES = 3;
-const NATS_CONNECT_RETRY_DELAY_MS = 2000;
-const NATS_RECONNECT_INTERVAL_MS = 30000;
-
-const FILE_POLL_FAST_MS = 1000;   // file-only mode
-const FILE_POLL_SLOW_MS = 5000;   // NATS-connected safety net
+const FILE_POLL_FAST_MS = 500;   // file backup polling interval
 
 const DEDUP_TTL_MS = 60000;
 const DEDUP_CLEANUP_INTERVAL_MS = 30000;
@@ -64,11 +58,6 @@ const recentEventIds = new Map(); // eventId -> expiryTimestamp
 const alwaysAllowCache = new Map(); // toolName -> expiryTimestamp
 const idleNotifiedPanes = new Set(); // pane ids that have been idle-notified
 const planModeNotifiedPanes = new Map(); // pane -> { notified: boolean, timestamp: number }
-
-let natsConnection = null;
-let natsStatus = 'disconnected'; // 'connected' | 'disconnected' | 'file-only'
-let natsSubscriptions = [];
-let natsReconnectTimer = null;
 
 let filePollTimer = null;
 let filePollIntervalMs = FILE_POLL_FAST_MS;
@@ -123,7 +112,7 @@ function checkSingleton() {
     try {
         if (fs.existsSync(PID_FILE)) {
             const existingPid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10);
-            if (existingPid && !isNaN(existingPid)) {
+            if (existingPid && !isNaN(existingPid) && existingPid !== process.pid) {
                 try {
                     process.kill(existingPid, 0); // check if alive
                     console.error(`popup-daemon already running (PID ${existingPid}). Exiting.`);
@@ -245,18 +234,7 @@ async function deliverReply(entryId, replyJson) {
 
     const jsonStr = JSON.stringify(replyJson);
 
-    if (pending.deliveryChannel === 'nats' && natsConnection) {
-        try {
-            const sc = natsStringCodec();
-            natsConnection.publish(pending.replySubject, sc.encode(jsonStr));
-            log(`Reply delivered via NATS: ${pending.replySubject}`);
-            return;
-        } catch (e) {
-            log(`NATS reply publish failed for ${pending.replySubject}: ${e.message}. Falling back to file.`);
-        }
-    }
-
-    // File fallback
+    // Always deliver via file + queue server reply endpoint
     try {
         fs.writeFileSync(pending.replyFilePath, jsonStr, 'utf8');
         log(`Reply delivered via file: ${pending.replyFilePath}`);
@@ -267,144 +245,74 @@ async function deliverReply(entryId, replyJson) {
     } catch (e) {
         log(`Failed to write reply file ${pending.replyFilePath}: ${e.message}`);
     }
-}
 
-// ─── NATS ───────────────────────────────────────────────────────────────────
-
-let _natsModule = null;
-let _natsStringCodec = null;
-
-function loadNats() {
-    if (!_natsModule) {
+    // Also post reply to queue server (for queue-wait-reply.js long-poll)
+    if (pending.replyId) {
         try {
-            _natsModule = require('nats');
-        } catch (e) {
-            log(`Cannot load nats module: ${e.message}`);
-            return null;
-        }
+            const postData = jsonStr;
+            const req = http.request({
+                hostname: '127.0.0.1',
+                port: 4223,
+                path: `/reply?id=${encodeURIComponent(pending.replyId)}`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(postData),
+                },
+                timeout: 2000,
+            }, () => {});
+            req.on('error', () => {}); // ignore errors — file delivery is primary
+            req.write(postData);
+            req.end();
+        } catch (_) {}
     }
-    return _natsModule;
 }
 
-function natsStringCodec() {
-    if (!_natsStringCodec) {
-        const nats = loadNats();
-        if (nats) _natsStringCodec = nats.StringCodec();
-    }
-    return _natsStringCodec;
-}
+// ─── HTTP Queue Subscription ───────────────────────────────────────────────
 
-async function connectNats() {
-    const nats = loadNats();
-    if (!nats) {
-        log('NATS module not available. Running in file-queue-only mode.');
-        natsStatus = 'file-only';
-        return false;
-    }
+const http = require('http');
 
-    for (let attempt = 1; attempt <= NATS_CONNECT_RETRIES; attempt++) {
-        try {
-            log(`NATS connect attempt ${attempt}/${NATS_CONNECT_RETRIES}...`);
-            natsConnection = await nats.connect({
-                servers: NATS_URL,
-                reconnect: false, // We manage reconnect ourselves
-                timeout: 5000,
-            });
-            natsStatus = 'connected';
-            log('NATS connected.');
+function subscribeQueue(channel, priority) {
+    const QUEUE_PORT = 4223;
+    const TIMEOUT_MS = 30000;
 
-            // Monitor for close/disconnect
-            (async () => {
-                try {
-                    const err = await natsConnection.closed();
-                    log(`NATS connection closed${err ? ': ' + err.message : ''}.`);
-                    handleNatsDisconnect();
-                } catch (_) {}
-            })();
-
-            await subscribeNats();
-            return true;
-        } catch (e) {
-            log(`NATS connect attempt ${attempt} failed: ${e.message}`);
-            if (attempt < NATS_CONNECT_RETRIES) {
-                await sleep(NATS_CONNECT_RETRY_DELAY_MS);
-            }
-        }
-    }
-
-    log('NATS unavailable after retries. Running in file-queue-only mode.');
-    natsStatus = 'file-only';
-    return false;
-}
-
-async function subscribeNats() {
-    if (!natsConnection) return;
-    const sc = natsStringCodec();
-
-    // Unsubscribe existing
-    for (const sub of natsSubscriptions) {
-        try { sub.unsubscribe(); } catch (_) {}
-    }
-    natsSubscriptions = [];
-
-    // Subscribe to claude.hooks (high priority)
-    const hooksSub = natsConnection.subscribe('claude.hooks');
-    natsSubscriptions.push(hooksSub);
-    (async () => {
-        for await (const msg of hooksSub) {
+    async function pollLoop() {
+        while (true) {
             try {
-                const data = JSON.parse(sc.decode(msg.data));
-                enqueueEvent(data, 'high', 'nats');
+                const msg = await new Promise((resolve, reject) => {
+                    const req = http.get(
+                        `http://127.0.0.1:${QUEUE_PORT}/sub?ch=${channel}&timeout=${TIMEOUT_MS}`,
+                        { timeout: TIMEOUT_MS + 5000 },
+                        (res) => {
+                            let body = '';
+                            res.on('data', d => body += d);
+                            res.on('end', () => {
+                                if (res.statusCode === 200 && body) resolve(body);
+                                else resolve(null); // 204 timeout or empty
+                            });
+                        }
+                    );
+                    req.on('error', reject);
+                    req.on('timeout', () => { req.destroy(); resolve(null); });
+                });
+                if (msg) {
+                    try {
+                        const data = JSON.parse(msg);
+                        enqueueEvent(data, priority, 'queue');
+                    } catch (e) {
+                        log(`subscribeQueue(${channel}): parse error: ${e.message}`);
+                    }
+                }
+                // no delay — immediately re-poll
             } catch (e) {
-                log(`Error parsing NATS hooks message: ${e.message}`);
+                // Server not running — retry after delay
+                log(`subscribeQueue(${channel}): server unavailable: ${e.message}. Retrying in 2s.`);
+                await sleep(2000);
             }
         }
-    })();
+    }
 
-    // Subscribe to claude.scanner (low priority)
-    const scannerSub = natsConnection.subscribe('claude.scanner');
-    natsSubscriptions.push(scannerSub);
-    (async () => {
-        for await (const msg of scannerSub) {
-            try {
-                const data = JSON.parse(sc.decode(msg.data));
-                enqueueEvent(data, 'low', 'nats');
-            } catch (e) {
-                log(`Error parsing NATS scanner message: ${e.message}`);
-            }
-        }
-    })();
-
-    log('Subscribed to claude.hooks and claude.scanner.');
-}
-
-function handleNatsDisconnect() {
-    natsConnection = null;
-    natsStatus = 'disconnected';
-    natsSubscriptions = [];
-    log('NATS disconnected. Switching to file-queue mode.');
-    setFilePollInterval(FILE_POLL_FAST_MS);
-    scheduleNatsReconnect();
-}
-
-function scheduleNatsReconnect() {
-    if (natsReconnectTimer) return;
-    natsReconnectTimer = setInterval(async () => {
-        if (natsStatus === 'connected') {
-            clearInterval(natsReconnectTimer);
-            natsReconnectTimer = null;
-            return;
-        }
-        log('Attempting NATS reconnect...');
-        const connected = await connectNats();
-        if (connected) {
-            clearInterval(natsReconnectTimer);
-            natsReconnectTimer = null;
-            log('NATS reconnected. Draining file queue.');
-            setFilePollInterval(FILE_POLL_SLOW_MS);
-            await drainFileQueues();
-        }
-    }, NATS_RECONNECT_INTERVAL_MS);
+    pollLoop().catch(e => log(`subscribeQueue(${channel}): fatal: ${e.message}`));
 }
 
 // ─── File Queue ─────────────────────────────────────────────────────────────
@@ -439,10 +347,6 @@ function pollDirectory(dir, priority) {
             try { fs.unlinkSync(filePath); } catch (_) {}
         }
     }
-}
-
-async function drainFileQueues() {
-    pollFileQueues();
 }
 
 // ─── Enqueue ────────────────────────────────────────────────────────────────
@@ -496,8 +400,8 @@ function enqueueEvent(envelope, priority, source) {
     // Store pending reply for blocking hooks
     if (eventType === 'PermissionRequest' || eventType === 'Elicitation') {
         pendingReplies.set(entryId, {
-            deliveryChannel: source === 'nats' ? 'nats' : 'file',
-            replySubject: envelope.replySubject || '',
+            deliveryChannel: 'file',
+            replyId: envelope.replyId || '',
             replyFilePath: envelope.replyFilePath || '',
             hookLaunchTimestamp,
         });
@@ -956,9 +860,10 @@ function showPermissionWithOptions(entry, tool, question, raw) {
             answer = match ? match[2] : result;
         }
 
-        const reply = buildPermissionReply('allow');
-        reply.hookSpecificOutput.decision.updatedInput = { answers: {} };
-        reply.hookSpecificOutput.decision.updatedInput.answers[qText] = answer;
+        const originalInput = raw.tool_input || {};
+        const updatedInput = { ...originalInput, answers: { ...(originalInput.answers || {}) } };
+        updatedInput.answers[qText] = answer;
+        const reply = buildPermissionReply('allow', { updatedInput });
         deliverReply(entry.entryId, reply);
     });
 }
@@ -1191,7 +1096,7 @@ function writeDaemonStatus() {
     }
 
     const status = {
-        nats: natsStatus,
+        transport: 'queue',
         queueDepth: highPriorityQueue.length + lowPriorityQueue.length,
         activePopup: activePopup
             ? `${activePopup.entry.type}:${activePopup.entry.tool_name || 'unknown'}`
@@ -1219,17 +1124,6 @@ async function shutdown(signal) {
     if (dedupCleanupTimer) clearInterval(dedupCleanupTimer);
     if (queueTimeoutTimer) clearInterval(queueTimeoutTimer);
     if (statusWriteTimer) clearInterval(statusWriteTimer);
-    if (natsReconnectTimer) clearInterval(natsReconnectTimer);
-
-    // Close NATS
-    if (natsConnection) {
-        try {
-            await natsConnection.close();
-            log('NATS connection closed.');
-        } catch (e) {
-            log(`Error closing NATS: ${e.message}`);
-        }
-    }
 
     // Kill active popup
     if (activePopup && activePopup.process) {
@@ -1271,31 +1165,20 @@ async function main() {
         log(`Unhandled rejection: ${reason}`);
     });
 
-    // Attempt NATS connection
-    const natsConnected = await connectNats();
+    // Subscribe to queue server channels
+    subscribeQueue('hooks', 'high');
+    subscribeQueue('scanner', 'low');
 
-    if (natsConnected) {
-        // NATS connected — drain file queue, poll at slow interval
-        await drainFileQueues();
-        setFilePollInterval(FILE_POLL_SLOW_MS);
-    } else {
-        // File-only mode — poll at fast interval
-        setFilePollInterval(FILE_POLL_FAST_MS);
-        scheduleNatsReconnect();
-    }
+    // File queue safety backup (fast polling)
+    setFilePollInterval(FILE_POLL_FAST_MS);
 
-    // Start dedup cleanup
+    // Other timers
     dedupCleanupTimer = setInterval(cleanupDedupSet, DEDUP_CLEANUP_INTERVAL_MS);
-
-    // Start queue timeout checker
     queueTimeoutTimer = setInterval(checkQueueTimeouts, QUEUE_TIMEOUT_CHECK_INTERVAL_MS);
-
-    // Start status writer
     writeDaemonStatus();
     statusWriteTimer = setInterval(writeDaemonStatus, STATUS_WRITE_INTERVAL_MS);
 
-    log('Daemon running. NATS=' + natsStatus +
-        ' filePollInterval=' + filePollIntervalMs + 'ms');
+    log('Daemon running. Queue subscription active. File backup polling at ' + FILE_POLL_FAST_MS + 'ms');
 }
 
 main().catch((err) => {

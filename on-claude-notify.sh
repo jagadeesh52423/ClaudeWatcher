@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# on-claude-notify.sh — Thin NATS publisher for Claude Code hooks
+# on-claude-notify.sh — Queue publisher for Claude Code hooks
 #
-# Reads JSON payload from stdin, builds an envelope, publishes to NATS
-# subject "claude.hooks" (with file-queue fallback), and exits immediately.
+# Reads JSON payload from stdin, builds an envelope, publishes to the
+# queue server (with file-queue fallback), and exits immediately.
 #
 # Exception: PermissionRequest and Elicitation are blocking hooks —
 # they wait up to 120s for a reply from the popup daemon before exiting.
@@ -23,10 +23,8 @@ QUEUE_DIR="$STATE_DIR/queue/hooks"
 REPLY_DIR="$STATE_DIR/reply"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-NATS_PUBLISH_TIMEOUT=3        # seconds — timeout for NATS publish
+QUEUE_PUBLISH_TIMEOUT=3       # seconds
 BLOCKING_REPLY_TIMEOUT=120    # seconds — max wait for blocking hook reply
-FILE_POLL_INTERVAL_NATS=5     # seconds — file poll interval when NATS is primary
-FILE_POLL_INTERVAL_ONLY=0.5   # seconds — file poll interval when NATS is down
 
 # ── Ensure directories exist ────────────────────────────────────────────────
 
@@ -128,10 +126,10 @@ fi
 
 # ── Build reply subject and file path (for blocking hooks) ───────────────────
 
-reply_subject=""
+reply_id=""
 reply_file_path=""
 if [[ "$is_blocking" == "true" ]]; then
-    reply_subject="claude.reply.${session_id}.$$"
+    reply_id="${session_id}-$$-$(date +%s%3N)"
     reply_file_path="$REPLY_DIR/${session_id}-$$.json"
 fi
 
@@ -151,7 +149,7 @@ const pane = process.env._ENV_PANE || "";
 const project = process.env._ENV_PROJECT || "";
 const hookLaunchTs = parseInt(process.env._ENV_HOOK_LAUNCH_TS, 10) || Date.now();
 const pid = process.env._ENV_PID || "";
-const replySubject = process.env._ENV_REPLY_SUBJECT || "";
+const replyId = process.env._ENV_REPLY_ID || "";
 const replyFilePath = process.env._ENV_REPLY_FILE_PATH || "";
 
 // Read raw payload from stdin
@@ -173,8 +171,8 @@ const envelope = {
 };
 
 // Add reply fields for blocking hooks
-if (replySubject) {
-    envelope.replySubject = replySubject;
+if (replyId) {
+    envelope.replyId = replyId;
     envelope.replyFilePath = replyFilePath;
 }
 
@@ -190,7 +188,7 @@ envelope=$(
     _ENV_PROJECT="$project" \
     _ENV_HOOK_LAUNCH_TS="$hook_launch_ts" \
     _ENV_PID="$$" \
-    _ENV_REPLY_SUBJECT="$reply_subject" \
+    _ENV_REPLY_ID="$reply_id" \
     _ENV_REPLY_FILE_PATH="$reply_file_path" \
     node "$_env_script" <<< "$payload" 2>/dev/null
 )
@@ -201,20 +199,15 @@ if [[ -z "$envelope" ]]; then
         exit 0
 fi
 
-# ── Publish to NATS (with file-queue fallback) ──────────────────────────────
+# ── Publish to queue server (with file-queue fallback) ──────────────────────
 
-nats_ok=false
-
-# nats-publish.js has its own 2s connection timeout — no external timeout needed
-if echo "$envelope" | node "$SCRIPT_DIR/nats-publish.js" 2>/dev/null; then
-    nats_ok=true
-    log "Published to NATS: $hook_event/$tool_name"
+if echo "$envelope" | node "$SCRIPT_DIR/queue-publish.js" 2>/dev/null; then
+    log "Published to queue: $hook_event/$tool_name"
 else
-    # NATS failed — write to file queue as durability fallback
     _ts=$(node -e "process.stdout.write(String(Date.now()))" 2>/dev/null || echo "0")
     _fallback_file="$QUEUE_DIR/${_ts}-${session_id}-$$.json"
     echo "$envelope" > "$_fallback_file"
-    log "NATS unavailable, wrote to file queue: $_fallback_file"
+    log "Queue unavailable, wrote to file queue: $_fallback_file"
 fi
 
 
@@ -229,52 +222,21 @@ fi
 # Wait for reply from the popup daemon, then write response to stdout.
 # ══════════════════════════════════════════════════════════════════════════════
 
-log "Blocking hook ($hook_event): waiting for reply on $reply_subject / $reply_file_path"
+log "Blocking hook ($hook_event): waiting for reply on $reply_id / $reply_file_path"
 
 reply_json=""
 
-if [[ "$nats_ok" == "true" ]]; then
-    # ── Dual-wait: NATS subscription + file poll (via nats-wait-reply.js) ────
-    # nats-wait-reply.js handles both NATS sub and file poll internally.
-    # It prints the reply JSON to stdout on success, exits 1 on timeout.
+# Wait for reply using queue-wait-reply.js (handles server-down fallback internally)
+reply_json=$(
+    node "$SCRIPT_DIR/queue-wait-reply.js" \
+        "$reply_id" \
+        "$BLOCKING_REPLY_TIMEOUT" \
+        "$reply_file_path" \
+    2>/dev/null
+) || true
 
-    # nats-wait-reply.js handles its own internal timeout, so we just run it directly
-    reply_json=$(
-        node "$SCRIPT_DIR/nats-wait-reply.js" \
-            "$reply_subject" \
-            "$BLOCKING_REPLY_TIMEOUT" \
-            "$reply_file_path" \
-        2>/dev/null
-    ) || true
-
-    if [[ -n "$reply_json" ]]; then
-        log "Blocking hook ($hook_event): reply received via NATS/dual-wait"
-    fi
-else
-    # ── File-only wait: poll reply file every 500ms ──────────────────────────
-    # NATS was down, so the daemon will write the reply file after processing
-    # the event from the file queue.
-
-    _deadline=$(( $(node -e "process.stdout.write(String(Date.now()))" 2>/dev/null) + BLOCKING_REPLY_TIMEOUT * 1000 ))
-    log "Blocking hook ($hook_event): file-only poll (NATS was down)"
-
-    while true; do
-        _now=$(node -e "process.stdout.write(String(Date.now()))" 2>/dev/null)
-        if (( _now >= _deadline )); then
-            log "Blocking hook ($hook_event): file-only poll timed out after ${BLOCKING_REPLY_TIMEOUT}s"
-            break
-        fi
-
-        if [[ -f "$reply_file_path" ]]; then
-            reply_json=$(cat "$reply_file_path" 2>/dev/null || true)
-            if [[ -n "$reply_json" ]]; then
-                log "Blocking hook ($hook_event): reply received via file poll"
-                break
-            fi
-        fi
-
-        sleep "$FILE_POLL_INTERVAL_ONLY"
-    done
+if [[ -n "$reply_json" ]]; then
+    log "Blocking hook ($hook_event): reply received"
 fi
 
 # ── Emit reply or timeout fallback ───────────────────────────────────────────
