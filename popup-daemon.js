@@ -204,15 +204,15 @@ function buildPermissionReply(behavior, extras) {
     };
 }
 
-function buildElicitationReply(action, response) {
+function buildElicitationReply(action, content) {
     const reply = {
         hookSpecificOutput: {
             hookEventName: 'Elicitation',
             action,
         },
     };
-    if (action === 'accept' && response) {
-        reply.hookSpecificOutput.response = response;
+    if (action === 'accept' && content) {
+        reply.hookSpecificOutput.content = content;
     }
     return reply;
 }
